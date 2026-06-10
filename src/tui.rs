@@ -1,4 +1,4 @@
-//! ratatui 交互界面：概览 / 持有人盈亏 / 资金流向 / 关联集群 四个标签页。
+//! ratatui 交互界面：概览 / 筹码结构 / 持有人盈亏 / 资金流向 / 关联集群 五个标签页。
 
 use crate::report::status_text;
 use crate::types::{Analysis, HolderPnl, fmt_time, human, short};
@@ -12,7 +12,7 @@ use ratatui::{Frame, Terminal};
 use std::collections::HashMap;
 use std::time::Duration;
 
-const TABS: [&str; 4] = ["概览", "持有人盈亏", "资金流向", "关联集群"];
+const TABS: [&str; 5] = ["概览", "筹码结构", "持有人盈亏", "资金流向", "关联集群"];
 
 #[derive(Clone, Copy, PartialEq)]
 enum SortBy {
@@ -25,7 +25,7 @@ enum SortBy {
 pub struct App<'a> {
     a: &'a Analysis,
     tab: usize,
-    tables: [TableState; 4],
+    tables: [TableState; 5],
     sort: SortBy,
     pnl_by_owner: HashMap<&'a str, &'a HolderPnl>,
     flow_rows: Vec<FlowRow<'a>>,
@@ -172,7 +172,7 @@ fn event_loop(
                     let i = state.selected().unwrap_or(0);
                     state.select(Some(i.saturating_sub(15)));
                 }
-                KeyCode::Char('s') if app.tab == 1 => {
+                KeyCode::Char('s') if app.tab == 2 => {
                     app.sort = match app.sort {
                         SortBy::Balance => SortBy::Unrealized,
                         SortBy::Unrealized => SortBy::Realized,
@@ -180,8 +180,8 @@ fn event_loop(
                         SortBy::Score => SortBy::Balance,
                     };
                 }
-                KeyCode::Enter if app.tab == 1 => {
-                    let i = app.tables[1].selected().unwrap_or(0);
+                KeyCode::Enter if app.tab == 2 => {
+                    let i = app.tables[2].selected().unwrap_or(0);
                     if let Some(h) = app.sorted_holders().get(i) {
                         if app.pnl_by_owner.contains_key(h.owner.as_str()) {
                             let mut st = TableState::default();
@@ -199,9 +199,9 @@ fn event_loop(
 impl<'a> App<'a> {
     fn row_count(&self) -> usize {
         match self.tab {
-            1 => self.a.holders.len().min(100),
-            2 => self.flow_rows.len(),
-            3 => self.a.clusters.len(),
+            2 => self.a.holders.len().min(100),
+            3 => self.flow_rows.len(),
+            4 => self.a.clusters.len(),
             _ => 0,
         }
     }
@@ -281,8 +281,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else {
         match app.tab {
             0 => draw_overview(f, chunks[2], app),
-            1 => draw_holders(f, chunks[2], app),
-            2 => draw_flow(f, chunks[2], app),
+            1 => draw_chips(f, chunks[2], app),
+            2 => draw_holders(f, chunks[2], app),
+            3 => draw_flow(f, chunks[2], app),
             _ => draw_clusters(f, chunks[2], app),
         }
     }
@@ -413,6 +414,149 @@ fn pnl_span(v: f64, fmt: String) -> Span<'static> {
     }
 }
 
+/// 筹码结构页：左=占比瓜分条+盈亏分布，右=筹码成本分布（筹码峰）
+fn draw_chips(f: &mut Frame, area: Rect, app: &App) {
+    use crate::chart;
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+        .split(area);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(cols[0]);
+
+    // ── 占比瓜分条
+    let shares = chart::holder_shares(&app.a.holders, 8);
+    let mut lines = vec![Line::from(chart::shares_bar(&shares, 46))];
+    lines.push(Line::from(Span::styled(
+        "巨鲸█ 大户▓ 中户▒ 散户░",
+        Style::new().fg(Color::DarkGray),
+    )));
+    for s in shares.top.iter().take(8) {
+        let color = match s.tier {
+            0 => Color::Red,
+            1 => Color::Yellow,
+            2 => Color::Cyan,
+            _ => Color::DarkGray,
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", chart::tier_char(s.tier)), Style::new().fg(color)),
+            Span::raw(format!("#{:<2} {} {:>6.2}%  ", s.rank, short(&s.owner), s.pct)),
+            Span::styled(
+                s.label.clone().unwrap_or_default(),
+                Style::new().fg(Color::Yellow),
+            ),
+        ]));
+    }
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered().title(format!(" 流通筹码瓜分 (已扫描 {:.1}%) ", shares.covered_pct)),
+        ),
+        left[0],
+    );
+
+    // ── 盈亏分布
+    let mut pnl_lines = Vec::new();
+    if let Some(d) = chart::pnl_distribution(&app.a.pnl) {
+        for (i, r) in d.rows.iter().take(12).enumerate() {
+            let color = if r.unrealized_sol >= 0.0 { Color::Green } else { Color::Red };
+            let sign = if r.unrealized_sol >= 0.0 { "▲" } else { "▼" };
+            pnl_lines.push(Line::from(vec![
+                Span::raw(format!("#{:<2}{} ", i + 1, short(&r.owner))),
+                Span::styled(chart::bar(r.position / d.max_position, 10), Style::new().fg(color)),
+                Span::styled(
+                    format!(" {sign}{:.2}◎", r.unrealized_sol),
+                    Style::new().fg(color),
+                ),
+            ]));
+        }
+        let total = d.profit_position + d.loss_position;
+        pnl_lines.push(Line::from(Span::styled(
+            format!(
+                "获利 {} 人 {} | 套牢 {} 人 {}",
+                d.profit_holders,
+                chart::amount_pct(d.profit_position, total),
+                d.loss_holders,
+                chart::amount_pct(d.loss_position, total),
+            ),
+            Style::new().fg(Color::DarkGray),
+        )));
+    } else {
+        pnl_lines.push(Line::from("  (Top 持有人多为转账型钱包，无浮动盈亏数据)"));
+    }
+    f.render_widget(
+        Paragraph::new(pnl_lines).block(Block::bordered().title(" 持有人浮动盈亏 (柱长=持仓量) ")),
+        left[1],
+    );
+
+    // ── 筹码成本分布（筹码峰）
+    let unit = app.a.token.symbol.as_deref().unwrap_or("token");
+    let mut peak_lines = Vec::new();
+    if let Some(h) = chart::cost_distribution(&app.a.pnl, app.a.last_price_sol, 12) {
+        let price_line = |px: f64| {
+            Line::from(Span::styled(
+                format!("─ 现价 {}◎ ─────────", chart::fmt_price(px)),
+                Style::new().fg(Color::Magenta).bold(),
+            ))
+        };
+        if let Some(px) = h.price {
+            if h.buckets.iter().filter(|b| b.amount > 0.0).all(|b| b.price < px) {
+                peak_lines.push(price_line(px));
+            }
+        }
+        let mut prev: Option<f64> = None;
+        for b in &h.buckets {
+            if b.amount <= 0.0 {
+                continue;
+            }
+            if let Some(px) = h.price {
+                if prev.is_some_and(|p| p > px) && b.price <= px {
+                    peak_lines.push(price_line(px));
+                }
+            }
+            let color = if b.underwater { Color::Red } else { Color::Green };
+            peak_lines.push(Line::from(vec![
+                Span::raw(format!("{}◎ ", chart::fmt_price(b.price))),
+                Span::styled(chart::bar(b.amount / h.max_amount, 16), Style::new().fg(color)),
+            ]));
+            prev = Some(b.price);
+        }
+        if let Some(px) = h.price {
+            if h.buckets.iter().filter(|b| b.amount > 0.0).all(|b| b.price > px) {
+                peak_lines.push(price_line(px));
+            }
+        }
+        let total = h.profit_amount + h.underwater_amount + h.unknown_amount;
+        peak_lines.push(Line::from(""));
+        peak_lines.push(Line::from(vec![
+            Span::styled(
+                format!("获利 {} ", chart::amount_pct(h.profit_amount, total)),
+                Style::new().fg(Color::Green),
+            ),
+            Span::styled(
+                format!("套牢 {} ", chart::amount_pct(h.underwater_amount, total)),
+                Style::new().fg(Color::Red),
+            ),
+        ]));
+        peak_lines.push(Line::from(Span::styled(
+            format!("成本未知 {}", chart::amount_pct(h.unknown_amount, total)),
+            Style::new().fg(Color::DarkGray),
+        )));
+        if let Some(peak) = h.peak_price {
+            peak_lines.push(Line::from(format!("主力成本区 {}◎", chart::fmt_price(peak))));
+        }
+    } else {
+        peak_lines.push(Line::from("  (无成本数据：Top 持有人多为转账型/未扫到买入)"));
+    }
+    f.render_widget(
+        Paragraph::new(peak_lines).block(
+            Block::bordered().title(format!(" 筹码成本分布 ({unit}, 柱长=该价位筹码量) ")),
+        ),
+        cols[1],
+    );
+}
+
 fn draw_holders(f: &mut Frame, area: Rect, app: &mut App) {
     let holders = app.sorted_holders();
 
@@ -492,7 +636,7 @@ fn draw_holders(f: &mut Frame, area: Rect, app: &mut App) {
     .block(Block::bordered().title(format!(
         " Top 持有人 (SOL 计价盈亏, 排序: {sort_name}, ~ 表示历史不完整) "
     )));
-    f.render_stateful_widget(table, area, &mut app.tables[1]);
+    f.render_stateful_widget(table, area, &mut app.tables[2]);
 }
 
 /// 单个持有人的交易明细（持有人盈亏页 Enter 打开）
@@ -620,7 +764,7 @@ fn draw_flow(f: &mut Frame, area: Rect, app: &mut App) {
     )
     .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
     .block(Block::bordered().title(" 资金来源 (各持有人钱包最早的 SOL 入金) "));
-    f.render_stateful_widget(table, area, &mut app.tables[2]);
+    f.render_stateful_widget(table, area, &mut app.tables[3]);
 }
 
 fn draw_clusters(f: &mut Frame, area: Rect, app: &mut App) {
@@ -675,5 +819,5 @@ fn draw_clusters(f: &mut Frame, area: Rect, app: &mut App) {
     .block(Block::bordered().title(
         " 关联资金集群 (同一来源给多个 Top 持有人打过钱 → 可能是关联钱包) ",
     ));
-    f.render_stateful_widget(table, area, &mut app.tables[3]);
+    f.render_stateful_widget(table, area, &mut app.tables[4]);
 }

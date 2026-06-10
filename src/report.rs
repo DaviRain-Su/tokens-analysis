@@ -46,6 +46,8 @@ pub fn print(a: &Analysis) {
         println!("  {name:<16} {count:>8} 个地址   占供应 {pct:.2}%");
     }
 
+    print_chip_charts(a);
+
     println!("\n── Top 持有人 ─────────────────────────────────────────────");
     println!(
         "{:<4}{:<14}{:>12}{:>8}  {}",
@@ -216,6 +218,119 @@ pub fn print(a: &Analysis) {
         );
     }
     println!();
+}
+
+/// 三张筹码可视化图：成本分布（筹码峰）/ 占比瓜分条 / 盈亏分布
+fn print_chip_charts(a: &Analysis) {
+    use crate::chart;
+    let unit = a.token.symbol.as_deref().unwrap_or("token");
+
+    // 1. 占比瓜分条（基于全部持有人，最直观）
+    let shares = chart::holder_shares(&a.holders, 10);
+    println!("\n── 流通筹码瓜分 (整条=已扫描的 {:.1}% 供应) ───────────────", shares.covered_pct);
+    println!("  {}", chart::shares_bar(&shares, 50));
+    println!("  巨鲸█ ≥1%   大户▓ 0.1-1%   中户▒ 0.01-0.1%   散户░ <0.01%");
+    for s in shares.top.iter().take(6) {
+        let label = s.label.as_deref().unwrap_or("");
+        println!(
+            "  {} #{:<2} {} {:>6.2}%  {}",
+            chart::tier_char(s.tier),
+            s.rank,
+            short(&s.owner),
+            s.pct,
+            label
+        );
+    }
+    if shares.rest_pct > 0.0 {
+        println!("  ░ 其余已扫描持有人          {:>6.2}%", shares.rest_pct);
+    }
+
+    // 2. 筹码成本分布（筹码峰），现价画成一条贯穿的分隔线
+    if let Some(h) = chart::cost_distribution(&a.pnl, a.last_price_sol, 10) {
+        println!(
+            "\n── 筹码成本分布 (基于 {} 个已分析持有人, 柱长=该价位筹码量) ──",
+            h.holders
+        );
+        let price_line = |px: f64| {
+            println!(
+                "  ─────── 现价 {}◎ ───────────────────────",
+                chart::fmt_price(px)
+            )
+        };
+        // 现价高于全部成本：先在顶部画线
+        if let Some(px) = h.price {
+            if h.buckets.iter().filter(|b| b.amount > 0.0).all(|b| b.price < px) {
+                price_line(px);
+            }
+        }
+        let mut prev: Option<f64> = None;
+        for b in &h.buckets {
+            if b.amount <= 0.0 {
+                continue;
+            }
+            // 现价落在上一个（更高）桶和当前桶之间 → 在此插入现价线
+            if let Some(px) = h.price {
+                if prev.is_some_and(|p| p > px) && b.price <= px {
+                    price_line(px);
+                }
+            }
+            let marker = if b.underwater { " 套牢" } else if h.price.is_some() { " 获利" } else { "" };
+            println!(
+                "  {}◎ {}{}",
+                chart::fmt_price(b.price),
+                chart::bar(b.amount / h.max_amount, 24),
+                marker
+            );
+            prev = Some(b.price);
+        }
+        // 现价低于全部成本：底部画线
+        if let Some(px) = h.price {
+            if h.buckets.iter().filter(|b| b.amount > 0.0).all(|b| b.price > px) {
+                price_line(px);
+            }
+        }
+        let total = h.profit_amount + h.underwater_amount + h.unknown_amount;
+        if let Some(px) = h.price {
+            println!(
+                "  现价 {}◎  获利盘 {} | 套牢盘 {} | 成本未知 {}",
+                chart::fmt_price(px),
+                chart::amount_pct(h.profit_amount, total),
+                chart::amount_pct(h.underwater_amount, total),
+                chart::amount_pct(h.unknown_amount, total),
+            );
+        }
+        if let Some(peak) = h.peak_price {
+            println!("  主力成本区: {}◎ ({unit})", chart::fmt_price(peak));
+        }
+    }
+
+    // 3. 持有人盈亏分布
+    if let Some(d) = chart::pnl_distribution(&a.pnl) {
+        println!("\n── 持有人浮动盈亏分布 (柱长=持仓量) ───────────────────────");
+        for (i, r) in d.rows.iter().take(12).enumerate() {
+            let sign = if r.unrealized_sol >= 0.0 { "▲" } else { "▼" };
+            let roi = r
+                .roi_pct
+                .map(|v| format!("{v:+.0}%"))
+                .unwrap_or_else(|| "  -".into());
+            println!(
+                "  {:<14}{} {sign}{:>8.3}◎ {:>7}",
+                chart::owner_tag(&r.owner, Some(i + 1)),
+                chart::bar(r.position / d.max_position, 16),
+                r.unrealized_sol,
+                roi
+            );
+        }
+        let total_pos = d.profit_position + d.loss_position;
+        println!(
+            "  获利 {} 人 (持仓 {}) | 套牢 {} 人 (持仓 {}) | 平均浮动 {:+.3}◎",
+            d.profit_holders,
+            chart::amount_pct(d.profit_position, total_pos),
+            d.loss_holders,
+            chart::amount_pct(d.loss_position, total_pos),
+            d.avg_unrealized,
+        );
+    }
 }
 
 pub fn status_text(p: &HolderPnl) -> String {

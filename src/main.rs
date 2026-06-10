@@ -1,5 +1,6 @@
 //! tokens-analysis: Solana SPL Token 筹码结构与资金流向分析工具。
 
+mod chart;
 mod dash;
 mod flow;
 mod holders;

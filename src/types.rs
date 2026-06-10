@@ -3,6 +3,8 @@
 #[derive(Clone, Debug)]
 pub struct TokenInfo {
     pub mint: String,
+    /// Metaplex / Token-2022 元数据里的 symbol
+    pub symbol: Option<String>,
     pub program: String,
     pub decimals: u8,
     pub supply: f64,
@@ -46,6 +48,8 @@ pub struct TradeEvent {
     pub usd_amount: f64,
     /// SOL 计价成交价
     pub price_sol: Option<f64>,
+    /// 转账对手方钱包（仅转入/转出时有值；买卖的对手是池子，不记录）
+    pub counterparty: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -82,10 +86,41 @@ pub struct HolderPnl {
 #[derive(Clone, Debug)]
 pub struct WatchEvent {
     pub mint: String,
+    /// 代币 symbol（监控循环填充，可能未知）
+    pub symbol: Option<String>,
     pub event: TradeEvent,
     /// 该钱包此 mint 的交易前/后余额（按比例跟卖时需要）
     pub pre_balance: f64,
     pub post_balance: f64,
+}
+
+impl WatchEvent {
+    pub fn token_disp(&self) -> String {
+        match &self.symbol {
+            Some(s) => format!("{s}({})", short(&self.mint)),
+            None => short(&self.mint),
+        }
+    }
+}
+
+/// Top 持有人之间的代币互转聚合边
+#[derive(Clone, Debug)]
+pub struct TransferLink {
+    pub from: String,
+    pub to: String,
+    pub tokens: f64,
+    pub count: usize,
+    pub last_time: Option<i64>,
+}
+
+/// 与历史快照的筹码对比
+#[derive(Clone, Debug)]
+pub struct SnapshotDiff {
+    pub base_time: i64,
+    /// (owner, 旧余额, 新余额)，按变化量绝对值降序
+    pub changes: Vec<(String, f64, f64)>,
+    pub new_holders: usize,
+    pub exited_holders: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -145,6 +180,10 @@ pub struct Analysis {
     pub sol_usd: Option<f64>,
     /// 代币机制安全检查结果
     pub safety: Option<crate::safety::SafetyReport>,
+    /// Top 持有人之间的代币互转
+    pub transfer_links: Vec<TransferLink>,
+    /// 与上次快照的筹码迁移对比
+    pub snapshot_diff: Option<SnapshotDiff>,
     /// 多跳资金溯源：来源钱包 → 它自己的上游入金（--hops >= 2 时填充）
     pub upstream: std::collections::HashMap<String, Vec<FundingSource>>,
 }

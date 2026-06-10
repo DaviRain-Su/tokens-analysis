@@ -182,6 +182,9 @@ pub fn parse_event(tx: &Value, owner: &str, mint: &str) -> Option<TradeEvent> {
     };
 
     let token_amount = token_delta.abs();
+    let counterparty = matches!(side, Side::TransferIn | Side::TransferOut)
+        .then(|| transfer_counterparty(meta, owner, mint, token_delta))
+        .flatten();
     Some(TradeEvent {
         signature: tx["transaction"]["signatures"][0]
             .as_str()
@@ -193,7 +196,33 @@ pub fn parse_event(tx: &Value, owner: &str, mint: &str) -> Option<TradeEvent> {
         sol_amount,
         usd_amount,
         price_sol: (sol_amount > 0.0 && token_amount > DUST).then(|| sol_amount / token_amount),
+        counterparty,
     })
+}
+
+/// 转账对手方：同一 mint 下变化量与我们反号、且数量最接近的另一个 owner。
+fn transfer_counterparty(meta: &Value, owner: &str, mint: &str, our_delta: f64) -> Option<String> {
+    use std::collections::HashMap;
+    let mut deltas: HashMap<String, f64> = HashMap::new();
+    for (key, sign) in [("preTokenBalances", -1.0), ("postTokenBalances", 1.0)] {
+        for b in meta[key].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+            if b["mint"].as_str() != Some(mint) {
+                continue;
+            }
+            let Some(o) = b["owner"].as_str() else { continue };
+            if o == owner {
+                continue;
+            }
+            *deltas.entry(o.to_string()).or_default() += sign * ui_amount(&b["uiTokenAmount"]);
+        }
+    }
+    deltas
+        .into_iter()
+        .filter(|(_, d)| d * our_delta < 0.0)
+        .min_by(|a, b| {
+            (a.1 + our_delta).abs().total_cmp(&(b.1 + our_delta).abs())
+        })
+        .map(|(o, _)| o)
 }
 
 fn token_balance_delta(meta: &Value, owner: &str, mint: &str) -> f64 {
@@ -362,6 +391,7 @@ pub fn parse_wallet_events(tx: &Value, owner: &str) -> Vec<crate::types::WatchEv
             let post = sum_balance(meta, "postTokenBalances", owner, mint);
             events.push(crate::types::WatchEvent {
                 mint: mint.clone(),
+                symbol: None,
                 event: e,
                 pre_balance: pre,
                 post_balance: post,

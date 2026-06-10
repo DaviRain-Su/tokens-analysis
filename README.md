@@ -14,6 +14,11 @@ Solana SPL Token 筹码结构与资金流向分析工具（Rust + TUI）。
 - **资金流向**：追溯每个持有人钱包最早的 SOL 入金来源，标注已知交易所热钱包，
   `--hops 2` 继续追上游来源的来源；识别多个持有人共享的资金来源
   （关联钱包集群，区分交易所弱关联、私人钱包强关联、同时段集中注资的钱包农场）
+- **代币互转图**：从转账事件解析对手方，聚合 Top 持有人之间的筹码搬运路线
+  （大户互倒筹码 = 同一控制人的强信号）
+- **筹码快照对比**：`--snapshot` 保存持有人快照，`--diff` 对比出谁加仓、
+  谁减仓、谁新进、谁清仓
+- **代币 symbol**：自动解析 Metaplex / Token-2022 元数据，全界面显示代币符号
 - **展示**：ratatui TUI 四个标签页（概览/持有人盈亏/资金流向/关联集群），
   持有人页按 Enter 查看单钱包交易明细；`--no-tui` 或管道输出时自动切换为纯文本报告
 
@@ -69,6 +74,14 @@ tokens-analysis watch --wallets <W1> --copy --live \
 
 # 止盈止损：现值达成本 2 倍清仓 / 跌到一半清仓（paper 模式也生效）
 tokens-analysis watch --wallets <W1> --copy --take-profit 2.0 --stop-loss 0.5
+
+# 买卖执行后推送通知
+tokens-analysis watch --wallets <W1> --copy --notify desktop     # macOS 通知中心
+tokens-analysis watch --wallets <W1> --copy --notify telegram    # env TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID
+
+# 筹码快照与迁移对比
+tokens-analysis analyze <MINT> --snapshot          # 保存快照
+tokens-analysis analyze <MINT> --diff              # 对比最近一次快照
 ```
 
 监控默认走 **WebSocket 实时推送**（logsSubscribe，亚秒级延迟，断线自动重连），

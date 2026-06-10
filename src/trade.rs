@@ -35,6 +35,8 @@ pub struct ExecConfig {
     pub stop_loss: f64,
     /// 仓位持久化文件
     pub positions_path: String,
+    /// 买卖执行后推送通知
+    pub notifier: Option<crate::notify::Notifier>,
 }
 
 /// 本工具买入的单个仓位
@@ -240,13 +242,19 @@ impl Executor {
             .as_str()
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(0.0);
+        let disp = ev.token_disp();
+        let mode = if self.cfg.live { "[LIVE]" } else { "[paper]" };
         println!(
-            "  → 跟买 {}: {:.4} SOL (冲击 {:.2}%) {}",
-            short(&ev.mint),
+            "  → 跟买 {disp}: {:.4} SOL (冲击 {:.2}%) {mode}",
             self.cfg.buy_sol,
             impact * 100.0,
-            if self.cfg.live { "[LIVE]" } else { "[paper]" }
         );
+        if let Some(n) = &self.cfg.notifier {
+            n.send(
+                &format!("跟买 {disp} {mode}"),
+                &format!("{:.4} SOL, 信号源 {}", self.cfg.buy_sol, short(src)),
+            );
+        }
         self.audit(json!({
             "action": "copy_buy", "src": src, "mint": ev.mint,
             "sol": self.cfg.buy_sol, "quote_out": out_amount,
@@ -299,13 +307,19 @@ impl Executor {
             .unwrap_or(0) as f64
             / 1e9;
         let fraction = sell_raw as f64 / held as f64;
+        let mode = if self.cfg.live { "[LIVE]" } else { "[paper]" };
         println!(
-            "  → {reason} {}: {:.0}% 仓位 ≈ {:.4} SOL {}",
+            "  → {reason} {}: {:.0}% 仓位 ≈ {:.4} SOL {mode}",
             short(mint),
             fraction * 100.0,
             out_sol,
-            if self.cfg.live { "[LIVE]" } else { "[paper]" }
         );
+        if let Some(n) = &self.cfg.notifier {
+            n.send(
+                &format!("{reason} {} {mode}", short(mint)),
+                &format!("{:.0}% 仓位 ≈ {out_sol:.4} SOL", fraction * 100.0),
+            );
+        }
         let mut entry = json!({
             "action": "sell", "reason": reason, "mint": mint,
             "sell_raw": sell_raw, "est_sol": out_sol,

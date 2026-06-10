@@ -71,6 +71,7 @@ pub async fn fetch_holders(rpc: &Rpc, mint: &str, mode: &str) -> Result<(TokenIn
 
     let token = TokenInfo {
         mint: mint.to_string(),
+        symbol: None,
         program,
         decimals,
         supply,
@@ -127,6 +128,7 @@ pub async fn fetch_specified(
     holders.sort_by(|a, b| b.balance.total_cmp(&a.balance));
     let token = TokenInfo {
         mint: mint.to_string(),
+        symbol: None,
         program,
         decimals,
         supply,

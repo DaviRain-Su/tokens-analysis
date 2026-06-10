@@ -256,7 +256,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     let header = Line::from(vec![
         Span::styled(" SPL Token 分析 ", Style::new().bold().fg(Color::Cyan)),
         Span::raw(format!(
-            "{}  供应 {}  持有人 {}{}  价格 {}",
+            "{}{}  供应 {}  持有人 {}{}  价格 {}",
+            t.symbol
+                .as_deref()
+                .map(|s| format!("{s} "))
+                .unwrap_or_default(),
             short(&t.mint),
             human(t.supply),
             t.holder_count,

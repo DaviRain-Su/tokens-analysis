@@ -12,6 +12,8 @@ use std::time::Duration;
 pub struct Watcher {
     /// 钱包 → 已见过的最新签名（基线，启动时不回放历史）
     cursor: HashMap<String, Option<String>>,
+    /// mint → symbol 缓存（None 表示已查过但没有元数据）
+    symbols: HashMap<String, Option<String>>,
 }
 
 impl Watcher {
@@ -24,7 +26,24 @@ impl Watcher {
             let latest = sigs[0]["signature"].as_str().map(String::from);
             cursor.insert(w.clone(), latest);
         }
-        Ok(Self { cursor })
+        Ok(Self {
+            cursor,
+            symbols: HashMap::new(),
+        })
+    }
+
+    /// 解析 mint 的 symbol（带缓存），填充到事件上。
+    async fn fill_symbols(&mut self, rpc: &Rpc, events: &mut [WatchEvent]) {
+        for ev in events {
+            if !self.symbols.contains_key(&ev.mint) {
+                let sym = crate::meta::fetch_meta(rpc, &ev.mint)
+                    .await
+                    .map(|m| m.symbol)
+                    .filter(|s| !s.is_empty());
+                self.symbols.insert(ev.mint.clone(), sym);
+            }
+            ev.symbol = self.symbols.get(&ev.mint).cloned().flatten();
+        }
     }
 
     /// 轮询模式（WebSocket 不可用时的回退路径）
@@ -42,7 +61,8 @@ impl Watcher {
             let wallets: Vec<String> = self.cursor.keys().cloned().collect();
             for w in wallets {
                 match self.poll_wallet(rpc, &w).await {
-                    Ok(events) => {
+                    Ok(mut events) => {
+                        self.fill_symbols(rpc, &mut events).await;
                         for ev in &events {
                             print_event(&w, ev);
                             if let Some(exec) = executor.as_deref_mut() {
@@ -102,10 +122,12 @@ impl Watcher {
                     }
                     match fetch_tx_with_retry(rpc, &sig).await {
                         Ok(tx_data) => {
-                            for ev in parse_wallet_events(&tx_data, &wallet) {
-                                print_event(&wallet, &ev);
+                            let mut events = parse_wallet_events(&tx_data, &wallet);
+                            self.fill_symbols(rpc, &mut events).await;
+                            for ev in &events {
+                                print_event(&wallet, ev);
                                 if let Some(exec) = executor.as_deref_mut() {
-                                    exec.on_event(rpc, &wallet, &ev).await;
+                                    exec.on_event(rpc, &wallet, ev).await;
                                 }
                             }
                         }
@@ -181,12 +203,15 @@ fn print_event(wallet: &str, ev: &WatchEvent) {
         .price_sol
         .map(|p| format!(" @{p:.10}"))
         .unwrap_or_default();
+    let token_disp = match &ev.symbol {
+        Some(s) => format!("{s}({})", short(&ev.mint)),
+        None => short(&ev.mint),
+    };
     println!(
-        "{} {} {color}{tag}\x1b[0m {} {}{value}{price}  (余额 {} → {})  {}",
+        "{} {} {color}{tag}\x1b[0m {} {token_disp}{value}{price}  (余额 {} → {})  {}",
         fmt_time(e.time),
         short(wallet),
         human(e.token_amount),
-        short(&ev.mint),
         human(ev.pre_balance),
         human(ev.post_balance),
         short(&e.signature),

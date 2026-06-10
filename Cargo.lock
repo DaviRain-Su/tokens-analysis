@@ -1722,6 +1722,7 @@ dependencies = [
  "bs58",
  "chrono",
  "clap",
+ "curve25519-dalek",
  "ed25519-dalek",
  "futures",
  "indicatif",
@@ -1729,6 +1730,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-tungstenite",
 ]

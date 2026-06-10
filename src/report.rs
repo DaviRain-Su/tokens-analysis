@@ -7,6 +7,9 @@ pub fn print(a: &Analysis) {
     println!("══════════════════════════════════════════════════════════");
     println!("  SPL Token 分析报告");
     println!("══════════════════════════════════════════════════════════");
+    if let Some(sym) = &t.symbol {
+        println!("代币:        {sym}");
+    }
     println!("Mint:        {}", t.mint);
     println!("Program:     {}", t.program);
     println!("总供应量:    {} (decimals={})", human(t.supply), t.decimals);
@@ -123,6 +126,63 @@ pub fn print(a: &Analysis) {
                     u.label.as_deref().unwrap_or("")
                 );
             }
+        }
+    }
+
+    if !a.transfer_links.is_empty() {
+        println!("\n── 代币互转 (已分析持有人 ↔ 其他钱包) ─────────────────────");
+        let rank: std::collections::HashMap<&str, usize> = a
+            .holders
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (h.owner.as_str(), i + 1))
+            .collect();
+        let tag = |addr: &str| -> String {
+            match rank.get(addr) {
+                Some(r) => format!("{}(#{r})", short(addr)),
+                None => short(addr),
+            }
+        };
+        for l in a.transfer_links.iter().take(15) {
+            println!(
+                "  {} → {}  {:>10} ×{:<3} {}",
+                tag(&l.from),
+                tag(&l.to),
+                human(l.tokens),
+                l.count,
+                fmt_time(l.last_time)
+            );
+        }
+    }
+
+    if let Some(d) = &a.snapshot_diff {
+        println!("\n── 筹码迁移 (对比 {} 快照) ──────────────", fmt_time(Some(d.base_time)));
+        println!(
+            "新进持有人 {} 个, 清仓退出 {} 个, 余额变化 {} 个",
+            d.new_holders,
+            d.exited_holders,
+            d.changes.len()
+        );
+        for (owner, old, new) in d.changes.iter().take(15) {
+            let delta = new - old;
+            let dir = if *old == 0.0 {
+                "🆕新进"
+            } else if *new == 0.0 {
+                "💨清仓"
+            } else if delta > 0.0 {
+                "↗加仓"
+            } else {
+                "↘减仓"
+            };
+            println!(
+                "  {} {:<14} {:>12} → {:<12} ({}{})",
+                dir,
+                short(owner),
+                human(*old),
+                human(*new),
+                if delta > 0.0 { "+" } else { "" },
+                human(delta)
+            );
         }
     }
 

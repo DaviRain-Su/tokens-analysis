@@ -3,10 +3,13 @@
 mod flow;
 mod holders;
 mod labels;
+mod meta;
+mod notify;
 mod pnl;
 mod report;
 mod rpc;
 mod safety;
+mod snapshot;
 mod trade;
 mod tui;
 mod types;
@@ -87,6 +90,10 @@ struct WatchArgs {
     /// 仓位持久化文件（默认 paper 模式 positions-paper.json，live 模式 positions.json）
     #[arg(long)]
     positions_file: Option<String>,
+
+    /// 买卖执行后推送通知: desktop (macOS) | telegram (env TELEGRAM_BOT_TOKEN/CHAT_ID)
+    #[arg(long)]
+    notify: Option<String>,
 
     /// 开启跟单（默认 paper 模式，只记录不下单）
     #[arg(long)]
@@ -185,6 +192,14 @@ struct Args {
     /// 导出聪明钱的最低评分
     #[arg(long, default_value_t = 40.0)]
     smart_min_score: f64,
+
+    /// 分析后保存持有人快照到 snapshots/<mint>/
+    #[arg(long)]
+    snapshot: bool,
+
+    /// 与历史快照对比筹码迁移（不带值 = 最近一次快照，或指定文件路径）
+    #[arg(long, num_args = 0..=1, default_missing_value = "latest")]
+    diff: Option<String>,
 }
 
 #[tokio::main]
@@ -330,6 +345,11 @@ async fn cmd_watch(mut args: WatchArgs) -> Result<()> {
             positions_path: args.positions_file.clone().unwrap_or_else(|| {
                 if args.live { "positions.json" } else { "positions-paper.json" }.into()
             }),
+            notifier: args
+                .notify
+                .as_deref()
+                .map(notify::Notifier::from_kind)
+                .transpose()?,
         };
         let exec = trade::Executor::new(cfg, w);
         println!(
@@ -535,7 +555,29 @@ async fn run_analysis(rpc: &Rpc, args: &Args) -> Result<Analysis> {
     let clusters = flow::find_clusters(&flows, &upstream);
     let sol_usd = pnl::sol_usd_price(rpc).await;
     let safety = safety::check_mint(rpc, &args.mint).await.ok();
+    let symbol = meta::fetch_meta(rpc, &args.mint).await.map(|m| m.symbol);
+    let transfer_links = build_transfer_links(&pnls);
 
+    // 快照: 先 diff 旧的，再保存新的
+    let snapshot_diff = match &args.diff {
+        Some(path) => match snapshot::load(&args.mint, path) {
+            Ok(old) => Some(snapshot::diff(&old, &all_holders)),
+            Err(e) => {
+                eprintln!("⚠ 快照对比失败: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+    if args.snapshot {
+        match snapshot::save(&args.mint, &all_holders, chrono::Utc::now().timestamp()) {
+            Ok(p) => eprintln!("✓ 快照已保存: {p}"),
+            Err(e) => eprintln!("⚠ 快照保存失败: {e}"),
+        }
+    }
+
+    let mut token = token;
+    token.symbol = symbol;
     Ok(Analysis {
         token,
         holders: all_holders,
@@ -548,5 +590,46 @@ async fn run_analysis(rpc: &Rpc, args: &Args) -> Result<Analysis> {
         sol_usd,
         safety,
         upstream,
+        transfer_links,
+        snapshot_diff,
     })
+}
+
+/// 聚合所有已分析持有人的转账事件为互转边 (from → to)。
+fn build_transfer_links(pnls: &[types::HolderPnl]) -> Vec<types::TransferLink> {
+    use std::collections::{HashMap, HashSet};
+    let mut edges: HashMap<(String, String), types::TransferLink> = HashMap::new();
+    // 双方都被分析时同一笔转账会出现两次（一边转出一边转入），按签名去重
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
+    for p in pnls {
+        for e in &p.events {
+            let Some(cp) = &e.counterparty else { continue };
+            let (from, to) = match e.side {
+                types::Side::TransferIn => (cp.clone(), p.owner.clone()),
+                types::Side::TransferOut => (p.owner.clone(), cp.clone()),
+                _ => continue,
+            };
+            if !seen.insert((from.clone(), to.clone(), e.signature.clone())) {
+                continue;
+            }
+            let link = edges
+                .entry((from.clone(), to.clone()))
+                .or_insert_with(|| types::TransferLink {
+                    from,
+                    to,
+                    tokens: 0.0,
+                    count: 0,
+                    last_time: None,
+                });
+            link.tokens += e.token_amount;
+            link.count += 1;
+            if e.time > link.last_time {
+                link.last_time = e.time;
+            }
+        }
+    }
+    let mut links: Vec<types::TransferLink> = edges.into_values().collect();
+    links.sort_by(|a, b| b.tokens.total_cmp(&a.tokens));
+    links.truncate(50);
+    links
 }

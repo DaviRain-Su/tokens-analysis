@@ -143,6 +143,8 @@ pub struct Analysis {
     pub last_price_time: Option<i64>,
     /// SOL/USD 汇率（从 Raydium SOL/USDC 池最近成交推导）
     pub sol_usd: Option<f64>,
+    /// 代币机制安全检查结果
+    pub safety: Option<crate::safety::SafetyReport>,
     /// 多跳资金溯源：来源钱包 → 它自己的上游入金（--hops >= 2 时填充）
     pub upstream: std::collections::HashMap<String, Vec<FundingSource>>,
 }

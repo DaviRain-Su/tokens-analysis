@@ -29,6 +29,9 @@ pub fn print(a: &Analysis) {
     if let Some(r) = a.sol_usd {
         println!("SOL/USD:     ${r:.2}");
     }
+    if let Some(s) = &a.safety {
+        println!("安全检查:    {}", s.summary());
+    }
 
     println!("\n── 筹码集中度 ─────────────────────────────────────────────");
     let d = &a.dist;
@@ -58,8 +61,8 @@ pub fn print(a: &Analysis) {
 
     println!("\n── 持有人盈亏 (SOL 计价) ──────────────────────────────────");
     println!(
-        "{:<14}{:>10}{:>10}{:>10}{:>10}{:>14}{:>10}{:>10}  {}",
-        "地址", "买入量", "卖出量", "转入量", "转出量", "均价(SOL)", "已实现", "浮动", "状态"
+        "{:<14}{:>10}{:>10}{:>10}{:>10}{:>14}{:>10}{:>10}{:>6}  {}",
+        "地址", "买入量", "卖出量", "转入量", "转出量", "均价(SOL)", "已实现", "浮动", "评分", "状态"
     );
     for p in &a.pnl {
         let avg = p
@@ -70,8 +73,11 @@ pub fn print(a: &Analysis) {
             .unrealized_sol
             .map(|v| format!("{v:+.3}"))
             .unwrap_or_else(|| "-".into());
+        let score = crate::pnl::smart_score(p, a.sol_usd)
+            .map(|s| format!("{s:.0}"))
+            .unwrap_or_else(|| "-".into());
         println!(
-            "{:<14}{:>10}{:>10}{:>10}{:>10}{:>14}{:>10}{:>10}  {}",
+            "{:<14}{:>10}{:>10}{:>10}{:>10}{:>14}{:>10}{:>10}{:>6}  {}",
             short(&p.owner),
             human(p.bought_tokens),
             human(p.sold_tokens),
@@ -80,6 +86,7 @@ pub fn print(a: &Analysis) {
             avg,
             format!("{:+.3}", p.realized_sol),
             unreal,
+            score,
             status_text(p)
         );
         if p.usd_spent > 0.0 || p.usd_received > 0.0 {

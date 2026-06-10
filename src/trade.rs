@@ -26,6 +26,8 @@ pub struct ExecConfig {
     pub log_path: String,
     /// SOL/USD 汇率，用于把稳定币计价的买入信号换算成 SOL 后判断触发阈值
     pub sol_usd: Option<f64>,
+    /// 跳过安全检查照常跟买（不建议）
+    pub allow_risky: bool,
 }
 
 pub struct Executor {
@@ -34,6 +36,8 @@ pub struct Executor {
     wallet: Wallet,
     /// 本工具买入的仓位: mint → 原始单位数量 (raw amount)
     positions: HashMap<String, u64>,
+    /// 安全检查结果缓存: mint → 是否通过
+    safety_cache: HashMap<String, bool>,
     spent_today: f64,
     day: String,
 }
@@ -50,9 +54,35 @@ impl Executor {
                 .expect("http client"),
             wallet,
             positions: HashMap::new(),
+            safety_cache: HashMap::new(),
             spent_today: 0.0,
             day: String::new(),
         }
+    }
+
+    /// 买前安全检查（带缓存）。检查失败（网络错误等）视为不安全。
+    async fn is_mint_safe(&mut self, rpc: &Rpc, mint: &str) -> bool {
+        if let Some(&ok) = self.safety_cache.get(mint) {
+            return ok;
+        }
+        let ok = match crate::safety::check_mint(rpc, mint).await {
+            Ok(report) => {
+                if !report.is_safe() {
+                    println!("  ⚠ 安全检查不通过 {}: {}", short(mint), report.summary());
+                    self.audit(json!({
+                        "action": "skip_buy", "mint": mint,
+                        "reason": "safety", "risks": report.risks,
+                    }));
+                }
+                report.is_safe()
+            }
+            Err(e) => {
+                eprintln!("  ⚠ 安全检查失败 {}: {e} (按不安全处理)", short(mint));
+                false
+            }
+        };
+        self.safety_cache.insert(mint.to_string(), ok);
+        ok
     }
 
     pub fn pubkey(&self) -> &str {
@@ -81,6 +111,9 @@ impl Executor {
                 .unwrap_or(0.0);
         if signal_sol < self.cfg.min_trigger_sol {
             return Ok(()); // 信号太小，不跟
+        }
+        if !self.cfg.allow_risky && !self.is_mint_safe(rpc, &ev.mint).await {
+            return Ok(()); // 机制风险（可增发/冻结/转账税等），不跟
         }
         self.roll_day();
         if self.spent_today + self.cfg.buy_sol > self.cfg.max_daily_sol {

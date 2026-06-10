@@ -6,6 +6,7 @@ mod labels;
 mod pnl;
 mod report;
 mod rpc;
+mod safety;
 mod trade;
 mod tui;
 mod types;
@@ -43,8 +44,16 @@ enum Command {
 #[derive(clap::Args)]
 struct WatchArgs {
     /// 要监控的钱包地址（逗号分隔或多次传入）
-    #[arg(long, value_delimiter = ',', required = true)]
+    #[arg(long, value_delimiter = ',')]
     wallets: Vec<String>,
+
+    /// 从文件读取监控钱包（每行一个地址，或 analyze --export-smart-money 的 JSONL）
+    #[arg(long)]
+    wallets_file: Option<String>,
+
+    /// 跳过买前安全检查（可增发/冻结/转账税的代币也跟买，不建议）
+    #[arg(long)]
+    allow_risky: bool,
 
     /// RPC 端点。未指定时依次取 env SOLANA_RPC_URL → Solana CLI 配置 → 公共节点
     #[arg(long, env = "SOLANA_RPC_URL")]
@@ -143,6 +152,14 @@ struct Args {
     /// 只分析指定钱包（可逗号分隔或多次传入），跳过全量持有人扫描
     #[arg(long, value_delimiter = ',')]
     owners: Vec<String>,
+
+    /// 把聪明钱钱包导出到 JSONL 文件（可直接喂给 watch --wallets-file）
+    #[arg(long)]
+    export_smart_money: Option<String>,
+
+    /// 导出聪明钱的最低评分
+    #[arg(long, default_value_t = 40.0)]
+    smart_min_score: f64,
 }
 
 #[tokio::main]
@@ -176,6 +193,10 @@ async fn cmd_analyze(args: Args) -> Result<()> {
 
     let analysis = run_analysis(&rpc, &args).await?;
 
+    if let Some(path) = &args.export_smart_money {
+        export_smart_money(&analysis, path, args.smart_min_score)?;
+    }
+
     if args.no_tui || !std::io::stdout().is_terminal() {
         report::print(&analysis);
     } else {
@@ -184,7 +205,74 @@ async fn cmd_analyze(args: Args) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_watch(args: WatchArgs) -> Result<()> {
+/// 按评分导出聪明钱钱包 (JSONL)，可直接喂给 watch --wallets-file。
+fn export_smart_money(a: &Analysis, path: &str, min_score: f64) -> Result<()> {
+    let mut scored: Vec<(pnl::SmartMetrics, &types::HolderPnl)> = a
+        .pnl
+        .iter()
+        .filter_map(|p| pnl::smart_metrics(p, a.sol_usd).map(|m| (m, p)))
+        .filter(|(m, _)| m.score >= min_score)
+        .collect();
+    scored.sort_by(|x, y| y.0.score.total_cmp(&x.0.score));
+    let mut out = String::new();
+    for (m, p) in &scored {
+        out.push_str(
+            &serde_json::json!({
+                "owner": p.owner,
+                "score": (m.score * 10.0).round() / 10.0,
+                "invested_sol": m.invested_sol,
+                "total_pnl_sol": m.total_pnl_sol,
+                "roi": m.roi,
+                "realized_sol": p.realized_sol,
+                "unrealized_sol": p.unrealized_sol,
+                "mint": a.token.mint,
+            })
+            .to_string(),
+        );
+        out.push('\n');
+    }
+    std::fs::write(path, &out)?;
+    eprintln!(
+        "✓ 已导出 {} 个聪明钱钱包 (评分 ≥ {min_score}) 到 {path}",
+        scored.len()
+    );
+    if scored.is_empty() {
+        eprintln!("  提示: 没有达标钱包。Top 大户多为转账型机构钱包，可加大 --top 覆盖更多真实交易者。");
+    }
+    Ok(())
+}
+
+/// 解析 --wallets-file：支持纯地址行或 export-smart-money 的 JSONL。
+fn load_wallets_file(path: &str) -> Result<Vec<String>> {
+    let content = std::fs::read_to_string(path)?;
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let addr = serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v["owner"].as_str().map(String::from))
+            .unwrap_or_else(|| line.to_string());
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    Ok(out)
+}
+
+async fn cmd_watch(mut args: WatchArgs) -> Result<()> {
+    if let Some(path) = &args.wallets_file {
+        for w in load_wallets_file(path)? {
+            if !args.wallets.contains(&w) {
+                args.wallets.push(w);
+            }
+        }
+    }
+    if args.wallets.is_empty() {
+        anyhow::bail!("没有要监控的钱包：请用 --wallets 或 --wallets-file 指定");
+    }
     let rpc_url = resolve_rpc(args.rpc.as_deref());
     eprintln!("RPC: {}", redact(&rpc_url));
     let rpc = Rpc::new(&rpc_url, args.concurrency);
@@ -211,6 +299,7 @@ async fn cmd_watch(args: WatchArgs) -> Result<()> {
             jupiter: args.jupiter.clone(),
             log_path: args.log.clone(),
             sol_usd,
+            allow_risky: args.allow_risky,
         };
         let exec = trade::Executor::new(cfg, w);
         println!(
@@ -392,6 +481,7 @@ async fn run_analysis(rpc: &Rpc, args: &Args) -> Result<Analysis> {
     };
     let clusters = flow::find_clusters(&flows, &upstream);
     let sol_usd = pnl::sol_usd_price(rpc).await;
+    let safety = safety::check_mint(rpc, &args.mint).await.ok();
 
     Ok(Analysis {
         token,
@@ -403,6 +493,7 @@ async fn run_analysis(rpc: &Rpc, args: &Args) -> Result<Analysis> {
         last_price_sol: last_price,
         last_price_time,
         sol_usd,
+        safety,
         upstream,
     })
 }

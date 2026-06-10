@@ -275,6 +275,59 @@ pub async fn pool_price(
     (best.map(|(_, px)| px), best.map(|(t, _)| t))
 }
 
+/// 聪明钱评分 (0-100)。None = 数据不足（没有真实买入，无法评估）。
+///
+/// 构成: ROI 50 分 (盈亏/投入, 500% 封顶) + 绝对利润 30 分 (100 SOL 封顶)
+///       + 交易活跃度 10 分 (10 笔买卖封顶) + 数据完整度 10 分。
+/// 稳定币腿按 sol_usd 汇率折算（做市商常用 USDC 进出）。
+/// 评分只衡量"在这个代币上的历史表现"，转账型大户（机构托管等）没有
+/// 买入成本，自然得不到分。
+pub fn smart_score(p: &HolderPnl, sol_usd: Option<f64>) -> Option<f64> {
+    smart_metrics(p, sol_usd).map(|m| m.score)
+}
+
+pub struct SmartMetrics {
+    pub score: f64,
+    /// 总投入 (SOL 等值)
+    pub invested_sol: f64,
+    /// 总盈亏 (SOL 等值)
+    pub total_pnl_sol: f64,
+    pub roi: f64,
+}
+
+pub fn smart_metrics(p: &HolderPnl, sol_usd: Option<f64>) -> Option<SmartMetrics> {
+    let usd_to_sol = |usd: f64| sol_usd.map(|r| usd / r).unwrap_or(0.0);
+    let invested = p.sol_spent + usd_to_sol(p.usd_spent);
+    if invested < 0.1 {
+        return None;
+    }
+    let total = p.realized_sol
+        + p.unrealized_sol.unwrap_or(0.0)
+        + usd_to_sol(p.usd_received - p.usd_spent);
+    let roi = total / invested;
+    let roi_part = (roi / 5.0).clamp(0.0, 1.0) * 50.0;
+    let profit_part = (total / 100.0).clamp(0.0, 1.0) * 30.0;
+    let trades = p
+        .events
+        .iter()
+        .filter(|e| matches!(e.side, Side::Buy | Side::Sell))
+        .count();
+    let activity_part = (trades as f64 / 10.0).clamp(0.0, 1.0) * 10.0;
+    let confidence = if !p.has_unknown_cost && !p.partial_history {
+        10.0
+    } else if !p.partial_history {
+        5.0
+    } else {
+        2.0
+    };
+    Some(SmartMetrics {
+        score: roi_part + profit_part + activity_part + confidence,
+        invested_sol: invested,
+        total_pnl_sol: total,
+        roi,
+    })
+}
+
 /// 监控模式用：解析一笔交易中钱包对“所有”代币的动向（不限定单一 mint）。
 /// 单代币 + SOL/稳定币对手腿 = 买/卖；两个代币一进一出 = token-token 互换；
 /// 其余视为转账。

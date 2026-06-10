@@ -19,6 +19,7 @@ enum SortBy {
     Balance,
     Unrealized,
     Realized,
+    Score,
 }
 
 pub struct App<'a> {
@@ -175,7 +176,8 @@ fn event_loop(
                     app.sort = match app.sort {
                         SortBy::Balance => SortBy::Unrealized,
                         SortBy::Unrealized => SortBy::Realized,
-                        SortBy::Realized => SortBy::Balance,
+                        SortBy::Realized => SortBy::Score,
+                        SortBy::Score => SortBy::Balance,
                     };
                 }
                 KeyCode::Enter if app.tab == 1 => {
@@ -214,6 +216,8 @@ impl<'a> App<'a> {
                         .get(h.owner.as_str())
                         .map(|p| match self.sort {
                             SortBy::Unrealized => p.unrealized_sol.unwrap_or(f64::NEG_INFINITY),
+                            SortBy::Score => crate::pnl::smart_score(p, self.a.sol_usd)
+                                .unwrap_or(f64::NEG_INFINITY),
                             _ => p.realized_sol,
                         })
                         .unwrap_or(f64::NEG_INFINITY)
@@ -330,6 +334,23 @@ fn draw_overview(f: &mut Frame, area: Rect, app: &App) {
     if let Some(r) = app.a.sol_usd {
         lines.push(Line::from(format!("SOL/USD:   ${r:.2}")));
     }
+    if let Some(s) = &app.a.safety {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("安全检查", Style::new().bold())));
+        if s.is_safe() {
+            lines.push(Line::from(Span::styled(
+                "✓ 通过 (无机制风险)",
+                Style::new().fg(Color::Green),
+            )));
+        } else {
+            for risk in &s.risks {
+                lines.push(Line::from(Span::styled(
+                    format!("✗ {risk}"),
+                    Style::new().fg(Color::Red),
+                )));
+            }
+        }
+    }
     lines.push(Line::from(Span::styled("筹码分层", Style::new().bold())));
     for (name, count, pct) in &d.buckets {
         lines.push(Line::from(format!(
@@ -412,6 +433,18 @@ fn draw_holders(f: &mut Frame, area: Rect, app: &mut App) {
             p.and_then(|p| p.unrealized_sol)
                 .map(|v| Cell::from(pnl_span(v, format!("{v:+.3}"))))
                 .unwrap_or_else(|| Cell::from("-")),
+            p.and_then(|p| crate::pnl::smart_score(p, app.a.sol_usd))
+                .map(|s| {
+                    let style = if s >= 70.0 {
+                        Style::new().fg(Color::Green).bold()
+                    } else if s >= 40.0 {
+                        Style::new().fg(Color::Yellow)
+                    } else {
+                        Style::new()
+                    };
+                    Cell::from(Span::styled(format!("{s:.0}"), style))
+                })
+                .unwrap_or_else(|| Cell::from("-")),
             Cell::from(
                 p.map(|p| status_text(p))
                     .unwrap_or_else(|| h.label.clone().unwrap_or_default()),
@@ -424,6 +457,7 @@ fn draw_holders(f: &mut Frame, area: Rect, app: &mut App) {
         SortBy::Balance => "余额",
         SortBy::Unrealized => "浮动盈亏",
         SortBy::Realized => "已实现盈亏",
+        SortBy::Score => "聪明钱评分",
     };
     let table = Table::new(
         rows,
@@ -439,13 +473,14 @@ fn draw_holders(f: &mut Frame, area: Rect, app: &mut App) {
             Constraint::Length(13),
             Constraint::Length(9),
             Constraint::Length(9),
+            Constraint::Length(5),
             Constraint::Min(8),
         ],
     )
     .header(
         Row::new([
             "#", "地址", "余额", "占比%", "买入量", "卖出量", "转入量", "转出量", "均价SOL",
-            "已实现", "浮动", "状态",
+            "已实现", "浮动", "评分", "状态",
         ])
         .style(Style::new().bold().fg(Color::Cyan)),
     )

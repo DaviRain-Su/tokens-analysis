@@ -28,6 +28,8 @@ pub struct App<'a> {
     sort: SortBy,
     pnl_by_owner: HashMap<&'a str, &'a HolderPnl>,
     flow_rows: Vec<FlowRow<'a>>,
+    /// 持有人盈亏页按 Enter 打开的交易明细 (owner, 滚动状态)
+    detail: Option<(String, TableState)>,
 }
 
 struct FlowRow<'a> {
@@ -35,6 +37,8 @@ struct FlowRow<'a> {
     rank: usize,
     source: Option<&'a crate::types::FundingSource>,
     reached_genesis: bool,
+    /// 0 = 直接入金, 1 = 上游(第二跳)
+    depth: usize,
 }
 
 pub fn run(a: &Analysis) -> Result<()> {
@@ -65,6 +69,7 @@ fn event_loop(
                 rank,
                 source: None,
                 reached_genesis: f.reached_genesis,
+                depth: 0,
             });
         }
         for s in f.sources.iter().take(5) {
@@ -73,7 +78,17 @@ fn event_loop(
                 rank,
                 source: Some(s),
                 reached_genesis: f.reached_genesis,
+                depth: 0,
             });
+            for u in a.upstream.get(&s.source).into_iter().flatten().take(3) {
+                flow_rows.push(FlowRow {
+                    owner: &f.owner,
+                    rank,
+                    source: Some(u),
+                    reached_genesis: f.reached_genesis,
+                    depth: 1,
+                });
+            }
         }
     }
 
@@ -84,6 +99,7 @@ fn event_loop(
         sort: SortBy::Balance,
         pnl_by_owner,
         flow_rows,
+        detail: None,
     };
     for t in &mut app.tables {
         t.select(Some(0));
@@ -96,6 +112,39 @@ fn event_loop(
         }
         if let Event::Key(key) = event::read()? {
             if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            // 交易明细弹层打开时按键只作用于明细表
+            if app.detail.is_some() {
+                let len = app
+                    .detail
+                    .as_ref()
+                    .and_then(|(o, _)| app.pnl_by_owner.get(o.as_str()))
+                    .map(|p| p.events.len())
+                    .unwrap_or(0);
+                let (_, state) = app.detail.as_mut().unwrap();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Backspace => {
+                        app.detail = None;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let i = state.selected().unwrap_or(0);
+                        state.select(Some((i + 1).min(len.saturating_sub(1))));
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        let i = state.selected().unwrap_or(0);
+                        state.select(Some(i.saturating_sub(1)));
+                    }
+                    KeyCode::PageDown => {
+                        let i = state.selected().unwrap_or(0);
+                        state.select(Some((i + 15).min(len.saturating_sub(1))));
+                    }
+                    KeyCode::PageUp => {
+                        let i = state.selected().unwrap_or(0);
+                        state.select(Some(i.saturating_sub(15)));
+                    }
+                    _ => {}
+                }
                 continue;
             }
             let len = app.row_count();
@@ -129,13 +178,23 @@ fn event_loop(
                         SortBy::Realized => SortBy::Balance,
                     };
                 }
+                KeyCode::Enter if app.tab == 1 => {
+                    let i = app.tables[1].selected().unwrap_or(0);
+                    if let Some(h) = app.sorted_holders().get(i) {
+                        if app.pnl_by_owner.contains_key(h.owner.as_str()) {
+                            let mut st = TableState::default();
+                            st.select(Some(0));
+                            app.detail = Some((h.owner.clone(), st));
+                        }
+                    }
+                }
                 _ => {}
             }
         }
     }
 }
 
-impl App<'_> {
+impl<'a> App<'a> {
     fn row_count(&self) -> usize {
         match self.tab {
             1 => self.a.holders.len().min(100),
@@ -143,6 +202,26 @@ impl App<'_> {
             3 => self.a.clusters.len(),
             _ => 0,
         }
+    }
+
+    /// 持有人盈亏页当前排序下的行顺序（渲染与 Enter 选中共用，保证一致）
+    fn sorted_holders(&self) -> Vec<&'a crate::types::Holder> {
+        let mut holders: Vec<&crate::types::Holder> = self.a.holders.iter().take(100).collect();
+        if self.sort != SortBy::Balance {
+            holders.sort_by(|x, y| {
+                let key = |h: &crate::types::Holder| {
+                    self.pnl_by_owner
+                        .get(h.owner.as_str())
+                        .map(|p| match self.sort {
+                            SortBy::Unrealized => p.unrealized_sol.unwrap_or(f64::NEG_INFINITY),
+                            _ => p.realized_sol,
+                        })
+                        .unwrap_or(f64::NEG_INFINITY)
+                };
+                key(y).total_cmp(&key(x))
+            });
+        }
+        holders
     }
 }
 
@@ -161,7 +240,14 @@ fn draw(f: &mut Frame, app: &mut App) {
     let price = app
         .a
         .last_price_sol
-        .map(|p| format!("{p:.10} SOL"))
+        .map(|p| {
+            let usd = app
+                .a
+                .sol_usd
+                .map(|r| format!(" (${:.8})", p * r))
+                .unwrap_or_default();
+            format!("{p:.10} SOL{usd}")
+        })
         .unwrap_or_else(|| "-".into());
     let header = Line::from(vec![
         Span::styled(" SPL Token 分析 ", Style::new().bold().fg(Color::Cyan)),
@@ -182,16 +268,24 @@ fn draw(f: &mut Frame, app: &mut App) {
         .block(Block::new().borders(Borders::BOTTOM));
     f.render_widget(tabs, chunks[1]);
 
-    match app.tab {
-        0 => draw_overview(f, chunks[2], app),
-        1 => draw_holders(f, chunks[2], app),
-        2 => draw_flow(f, chunks[2], app),
-        _ => draw_clusters(f, chunks[2], app),
+    if app.detail.is_some() {
+        draw_detail(f, chunks[2], app);
+    } else {
+        match app.tab {
+            0 => draw_overview(f, chunks[2], app),
+            1 => draw_holders(f, chunks[2], app),
+            2 => draw_flow(f, chunks[2], app),
+            _ => draw_clusters(f, chunks[2], app),
+        }
     }
 
-    let help = match app.tab {
-        1 => " q 退出 | ←→/Tab 切换标签 | ↑↓ 滚动 | s 切换排序",
-        _ => " q 退出 | ←→/Tab 切换标签 | ↑↓ 滚动",
+    let help = if app.detail.is_some() {
+        " Esc 返回 | ↑↓ 滚动"
+    } else {
+        match app.tab {
+            1 => " q 退出 | ←→/Tab 切换标签 | ↑↓ 滚动 | s 切换排序 | Enter 交易明细",
+            _ => " q 退出 | ←→/Tab 切换标签 | ↑↓ 滚动",
+        }
     };
     f.render_widget(
         Paragraph::new(help).style(Style::new().fg(Color::DarkGray)),
@@ -232,6 +326,9 @@ fn draw_overview(f: &mut Frame, area: Rect, app: &App) {
                 fmt_time(app.a.last_price_time)
             )),
         );
+    }
+    if let Some(r) = app.a.sol_usd {
+        lines.push(Line::from(format!("SOL/USD:   ${r:.2}")));
     }
     lines.push(Line::from(Span::styled("筹码分层", Style::new().bold())));
     for (name, count, pct) in &d.buckets {
@@ -292,21 +389,7 @@ fn pnl_span(v: f64, fmt: String) -> Span<'static> {
 }
 
 fn draw_holders(f: &mut Frame, area: Rect, app: &mut App) {
-    let mut holders: Vec<&crate::types::Holder> = app.a.holders.iter().take(100).collect();
-    if app.sort != SortBy::Balance {
-        holders.sort_by(|x, y| {
-            let key = |h: &crate::types::Holder| {
-                app.pnl_by_owner
-                    .get(h.owner.as_str())
-                    .map(|p| match app.sort {
-                        SortBy::Unrealized => p.unrealized_sol.unwrap_or(f64::NEG_INFINITY),
-                        _ => p.realized_sol,
-                    })
-                    .unwrap_or(f64::NEG_INFINITY)
-            };
-            key(y).total_cmp(&key(x))
-        });
-    }
+    let holders = app.sorted_holders();
 
     let rows = holders.iter().enumerate().map(|(i, h)| {
         let p = app.pnl_by_owner.get(h.owner.as_str());
@@ -373,13 +456,91 @@ fn draw_holders(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(table, area, &mut app.tables[1]);
 }
 
+/// 单个持有人的交易明细（持有人盈亏页 Enter 打开）
+fn draw_detail(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some((owner, _)) = &app.detail else { return };
+    let owner = owner.clone();
+    let Some(p) = app.pnl_by_owner.get(owner.as_str()) else {
+        return;
+    };
+    let sol_usd = app.a.sol_usd;
+    let rows = p.events.iter().rev().map(|e| {
+        let (side, color) = match e.side {
+            crate::types::Side::Buy => ("买入", Color::Green),
+            crate::types::Side::Sell => ("卖出", Color::Red),
+            crate::types::Side::TransferIn => ("转入", Color::Cyan),
+            crate::types::Side::TransferOut => ("转出", Color::Yellow),
+        };
+        let value = if e.sol_amount > 0.0 {
+            format!("{:.4} SOL", e.sol_amount)
+        } else if e.usd_amount > 0.0 {
+            format!("${:.2}", e.usd_amount)
+        } else {
+            "-".into()
+        };
+        let price = e
+            .price_sol
+            .map(|px| {
+                let usd = sol_usd
+                    .map(|r| format!(" (${:.8})", px * r))
+                    .unwrap_or_default();
+                format!("{px:.10}{usd}")
+            })
+            .unwrap_or_else(|| "-".into());
+        Row::new(vec![
+            Cell::from(fmt_time(e.time)),
+            Cell::from(Span::styled(side, Style::new().fg(color).bold())),
+            Cell::from(human(e.token_amount)),
+            Cell::from(value),
+            Cell::from(price),
+            Cell::from(short(&e.signature)),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(17),
+            Constraint::Length(6),
+            Constraint::Length(11),
+            Constraint::Length(14),
+            Constraint::Length(26),
+            Constraint::Min(12),
+        ],
+    )
+    .header(
+        Row::new(["时间", "方向", "数量", "对价", "价格(SOL)", "签名"])
+            .style(Style::new().bold().fg(Color::Cyan)),
+    )
+    .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+    .block(Block::bordered().title(format!(
+        " {} 交易明细 ({} 笔, 新→旧{}) ",
+        short(&owner),
+        p.events.len(),
+        if p.partial_history { ", 历史已截断" } else { "" }
+    )));
+    let state = &mut app.detail.as_mut().unwrap().1;
+    f.render_stateful_widget(table, area, state);
+}
+
 fn draw_flow(f: &mut Frame, area: Rect, app: &mut App) {
     let rows = app.flow_rows.iter().map(|r| {
         match r.source {
             Some(s) => Row::new(vec![
-                Cell::from(format!("#{}", r.rank)),
-                Cell::from(short(r.owner)),
-                Cell::from(format!("← {}", short(&s.source))),
+                Cell::from(if r.depth == 0 {
+                    format!("#{}", r.rank)
+                } else {
+                    String::new()
+                }),
+                Cell::from(if r.depth == 0 {
+                    short(r.owner)
+                } else {
+                    String::new()
+                }),
+                Cell::from(if r.depth == 0 {
+                    format!("← {}", short(&s.source))
+                } else {
+                    format!("  ↖ {}", short(&s.source))
+                }),
                 Cell::from(match &s.label {
                     Some(l) => Span::styled(l.clone(), Style::new().fg(Color::Yellow)),
                     None => Span::raw(""),

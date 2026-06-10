@@ -16,11 +16,18 @@ pub fn print(a: &Analysis) {
         println!("持有人数量:  ≥{} (仅 Top20 模式，RPC 不支持全量扫描)", t.holder_count);
     }
     if let Some(px) = a.last_price_sol {
+        let usd = a
+            .sol_usd
+            .map(|r| format!("  ≈ ${:.8}", px * r))
+            .unwrap_or_default();
         println!(
-            "最新成交价:  {:.10} SOL  ({})",
+            "最新成交价:  {:.10} SOL{usd}  ({})",
             px,
             fmt_time(a.last_price_time)
         );
+    }
+    if let Some(r) = a.sol_usd {
+        println!("SOL/USD:     ${r:.2}");
     }
 
     println!("\n── 筹码集中度 ─────────────────────────────────────────────");
@@ -99,6 +106,16 @@ pub fn print(a: &Analysis) {
                 fmt_time(s.first_time),
                 s.label.as_deref().unwrap_or("")
             );
+            for u in a.upstream.get(&s.source).into_iter().flatten().take(3) {
+                println!(
+                    "       ↖ {:<14} {:>9.4} SOL ×{:<3} {} {}",
+                    short(&u.source),
+                    u.total_sol,
+                    u.count,
+                    fmt_time(u.first_time),
+                    u.label.as_deref().unwrap_or("")
+                );
+            }
         }
     }
 

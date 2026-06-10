@@ -275,6 +275,52 @@ pub async fn pool_price(
     (best.map(|(_, px)| px), best.map(|(t, _)| t))
 }
 
+/// 从 Raydium SOL/USDC 池推导 SOL/USD 汇率：
+/// 该池金库由 Raydium V4 权限账户持有，其 USDC 与 wSOL 的余额变化量之比
+/// 就是成交汇率（parse_event 以 USDC 为目标 mint 时 price_sol = SOL/USDC，取倒数）。
+pub async fn sol_usd_price(rpc: &Rpc) -> Option<f64> {
+    const RAYDIUM_AUTH: &str = "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1";
+    let res = rpc
+        .call(
+            "getTokenAccountsByOwner",
+            serde_json::json!([RAYDIUM_AUTH, {"mint": USDC}, {"encoding": "jsonParsed"}]),
+        )
+        .await
+        .ok()?;
+    // 取余额最大的 USDC 金库（即最深的 USDC 交易对，通常是 SOL/USDC）
+    let vault = res["value"]
+        .as_array()?
+        .iter()
+        .max_by(|a, b| {
+            let bal = |v: &&Value| {
+                ui_amount(&v["account"]["data"]["parsed"]["info"]["tokenAmount"])
+            };
+            bal(a).total_cmp(&bal(b))
+        })?["pubkey"]
+        .as_str()?
+        .to_string();
+    let sigs = rpc.signatures(&vault, 15).await.ok()?;
+    let txs = join_all(
+        sigs.iter()
+            .filter(|s| s["err"].is_null())
+            .filter_map(|s| s["signature"].as_str())
+            .map(|sig| rpc.transaction(sig)),
+    )
+    .await;
+    let mut best: Option<(i64, f64)> = None;
+    for tx in txs.into_iter().flatten() {
+        if let Some(e) = parse_event(&tx, RAYDIUM_AUTH, USDC) {
+            if let (Some(t), Some(px)) = (e.time, e.price_sol) {
+                if px > 0.0 && best.is_none_or(|(bt, _)| t > bt) {
+                    best = Some((t, px));
+                }
+            }
+        }
+    }
+    // price_sol = SOL per USDC，倒数即 USD per SOL
+    best.map(|(_, px)| 1.0 / px)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

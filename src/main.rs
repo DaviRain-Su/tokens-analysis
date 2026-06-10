@@ -45,6 +45,10 @@ struct Args {
     #[arg(long, default_value_t = 25)]
     funding_scan: usize,
 
+    /// 资金溯源跳数：1 = 只看持有人的直接入金，2 = 继续追上游来源的来源
+    #[arg(long, default_value_t = 1)]
+    hops: usize,
+
     /// RPC 并发请求数
     #[arg(long, default_value_t = 8)]
     concurrency: usize,
@@ -223,7 +227,18 @@ async fn run_analysis(rpc: &Rpc, args: &Args) -> Result<Analysis> {
         }
     }
     flow::annotate_holder_sources(&mut flows, &all_holders);
-    let clusters = flow::find_clusters(&flows);
+
+    // 5. 多跳上游溯源 + SOL/USD 汇率
+    let upstream = if args.hops >= 2 {
+        let pb = spinner(&format!("追溯上游资金 (hops={})...", args.hops));
+        let up = flow::trace_upstream(rpc, &flows, args.hops, args.funding_scan).await;
+        pb.finish_with_message(format!("✓ 上游溯源完成: {} 个来源钱包", up.len()));
+        up
+    } else {
+        Default::default()
+    };
+    let clusters = flow::find_clusters(&flows, &upstream);
+    let sol_usd = pnl::sol_usd_price(rpc).await;
 
     Ok(Analysis {
         token,
@@ -234,5 +249,7 @@ async fn run_analysis(rpc: &Rpc, args: &Args) -> Result<Analysis> {
         clusters,
         last_price_sol: last_price,
         last_price_time,
+        sol_usd,
+        upstream,
     })
 }

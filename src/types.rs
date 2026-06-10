@@ -131,6 +131,10 @@ pub struct Analysis {
     /// 全部已解析交易里最近一笔 SOL 计价成交价
     pub last_price_sol: Option<f64>,
     pub last_price_time: Option<i64>,
+    /// SOL/USD 汇率（从 Raydium SOL/USDC 池最近成交推导）
+    pub sol_usd: Option<f64>,
+    /// 多跳资金溯源：来源钱包 → 它自己的上游入金（--hops >= 2 时填充）
+    pub upstream: std::collections::HashMap<String, Vec<FundingSource>>,
 }
 
 pub fn fmt_time(t: Option<i64>) -> String {

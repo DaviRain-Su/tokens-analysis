@@ -116,6 +116,59 @@ fn collect_sol_transfers(instrs: &Value, owner: &str, out: &mut Vec<(String, f64
     }
 }
 
+/// 多跳溯源：对第一跳发现的私人钱包来源，继续追它们自己的上游入金。
+/// 返回 来源钱包 → 上游入金列表。交易所与灰尘来源不再展开。
+pub async fn trace_upstream(
+    rpc: &Rpc,
+    flows: &[HolderFlow],
+    hops: usize,
+    scan_limit: usize,
+) -> HashMap<String, Vec<FundingSource>> {
+    const MAX_TRACES_PER_HOP: usize = 20;
+    let mut upstream: HashMap<String, Vec<FundingSource>> = HashMap::new();
+    let mut visited: std::collections::HashSet<String> =
+        flows.iter().map(|f| f.owner.clone()).collect();
+    let mut frontier: Vec<String> = flows
+        .iter()
+        .flat_map(|f| f.sources.iter())
+        .filter(|s| expandable(s))
+        .map(|s| s.source.clone())
+        .collect();
+
+    for _ in 1..hops {
+        frontier.retain(|s| visited.insert(s.clone()));
+        frontier.truncate(MAX_TRACES_PER_HOP);
+        if frontier.is_empty() {
+            break;
+        }
+        let results = join_all(
+            frontier
+                .iter()
+                .map(|src| trace_funding(rpc, src, scan_limit)),
+        )
+        .await;
+        let mut next = Vec::new();
+        for (src, r) in frontier.iter().zip(results) {
+            if let Ok(f) = r {
+                next.extend(
+                    f.sources
+                        .iter()
+                        .filter(|s| expandable(s))
+                        .map(|s| s.source.clone()),
+                );
+                upstream.insert(src.clone(), f.sources);
+            }
+        }
+        frontier = next;
+    }
+    upstream
+}
+
+/// 是否值得继续向上追：排除交易所/已知标签和灰尘来源
+fn expandable(s: &FundingSource) -> bool {
+    s.total_sol >= 0.05 && s.label.is_none()
+}
+
 /// 资金来源若本身就是 Top 持有人，标注出来（大户间互转是强关联信号）。
 pub fn annotate_holder_sources(flows: &mut [HolderFlow], holders: &[crate::types::Holder]) {
     use std::collections::HashMap as Map;
@@ -139,7 +192,36 @@ pub fn annotate_holder_sources(flows: &mut [HolderFlow], holders: &[crate::types
 
 /// 跨持有人找共享资金来源。交易所热钱包给很多人打过钱，关联性弱；
 /// 非交易所的共享来源是强关联信号（很可能是同一控制人/分发钱包）。
-pub fn find_clusters(flows: &[HolderFlow]) -> Vec<Cluster> {
+/// upstream 非空时把第二跳来源也算进每个持有人的可达来源（标注 ·2跳）。
+pub fn find_clusters(
+    flows: &[HolderFlow],
+    upstream: &HashMap<String, Vec<FundingSource>>,
+) -> Vec<Cluster> {
+    let flows: Vec<HolderFlow> = flows
+        .iter()
+        .map(|f| {
+            let mut f = f.clone();
+            let indirect: Vec<FundingSource> = f
+                .sources
+                .iter()
+                .filter_map(|s| upstream.get(&s.source))
+                .flatten()
+                .map(|s| FundingSource {
+                    label: Some(match &s.label {
+                        Some(l) => format!("{l}·2跳"),
+                        None => "2跳".into(),
+                    }),
+                    ..s.clone()
+                })
+                .collect();
+            f.sources.extend(indirect);
+            f
+        })
+        .collect();
+    find_clusters_inner(&flows)
+}
+
+fn find_clusters_inner(flows: &[HolderFlow]) -> Vec<Cluster> {
     struct Acc {
         label: Option<String>,
         holders: Vec<String>,

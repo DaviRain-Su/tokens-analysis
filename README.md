@@ -40,7 +40,21 @@ cargo build --release
 建议使用支持 `getProgramAccounts` 的 RPC（如 [Triton One](https://docs.triton.one)）。
 公共节点会回退到 Top20 模式且 `getTokenLargestAccounts` 经常被限流。
 
+## 聪明钱发现 → 跟单闭环
+
+```bash
+# 1. 分析代币，按评分导出聪明钱（ROI/利润/活跃度/数据完整度加权，0-100）
+tokens-analysis analyze <MINT> --top 30 --export-smart-money smart.jsonl --smart-min-score 60
+
+# 2. 直接监控这批钱包并跟单
+tokens-analysis watch --wallets-file smart.jsonl --copy
+```
+
 ## 监控与跟单
+
+跟买前自动做**安全检查**：mint/freeze authority 未放弃、Token-2022 转账税 >1%、
+transfer hook、永久代理、默认冻结账户——任一命中即跳过该代币并写审计日志
+（`--allow-risky` 可关闭，不建议）。
 
 ```bash
 # 监控钱包动向（只打印事件流）

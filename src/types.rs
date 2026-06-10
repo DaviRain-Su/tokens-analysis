@@ -78,6 +78,16 @@ pub struct HolderPnl {
     pub last_time: Option<i64>,
 }
 
+/// 监控模式下解析出的单笔钱包动向
+#[derive(Clone, Debug)]
+pub struct WatchEvent {
+    pub mint: String,
+    pub event: TradeEvent,
+    /// 该钱包此 mint 的交易前/后余额（按比例跟卖时需要）
+    pub pre_balance: f64,
+    pub post_balance: f64,
+}
+
 #[derive(Clone, Debug)]
 pub struct FundingSource {
     pub source: String,

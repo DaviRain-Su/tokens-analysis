@@ -40,6 +40,32 @@ cargo build --release
 建议使用支持 `getProgramAccounts` 的 RPC（如 [Triton One](https://docs.triton.one)）。
 公共节点会回退到 Top20 模式且 `getTokenLargestAccounts` 经常被限流。
 
+## 监控与跟单
+
+```bash
+# 监控钱包动向（只打印事件流）
+tokens-analysis watch --wallets <W1>,<W2>
+
+# paper 跟单：记录决策与报价，不发交易（默认）
+tokens-analysis watch --wallets <W1> --copy
+
+# 真实下单（启动时需确认；务必先跑 paper 验证）
+tokens-analysis watch --wallets <W1> --copy --live \
+  --buy-sol 0.05 --max-daily-sol 0.5 --slippage-bps 300 --min-trigger-sol 0.5
+```
+
+执行路径：Jupiter Swap API 报价/组交易 → 本地 ed25519 签名（签名前校验
+fee payer 是本钱包）→ `sendTransaction`（含 preflight 模拟）→ 轮询确认。
+密钥默认读 `~/.config/solana/id.json`（Solana CLI 格式），可用 `--keypair` 指定。
+
+安全护栏：默认 paper；`--live` 启动需输入 yes；单笔固定金额 + 每日总额上限 +
+滑点上限 + 触发阈值（过滤灰尘信号，稳定币买入按 SOL/USD 汇率折算）；
+跟卖只卖本工具买入的仓位、比例跟随目标钱包；所有决策写 JSONL 审计日志。
+
+⚠ **风险提示**：跟单交易使用真实资金，行情剧烈时滑点保护可能使交易失败或
+成交价劣于预期；目标钱包可能反向操作或洗盘。请只用可承受损失的资金，
+从小额（如 `--buy-sol 0.01`）开始验证。
+
 ## 数据口径说明
 
 - 盈亏以 **SOL 计价**；稳定币（USDC/USDT）腿的交易单独累计为 USD 金额，不折算进 SOL 成本

@@ -275,6 +275,72 @@ pub async fn pool_price(
     (best.map(|(_, px)| px), best.map(|(t, _)| t))
 }
 
+/// 监控模式用：解析一笔交易中钱包对“所有”代币的动向（不限定单一 mint）。
+/// 单代币 + SOL/稳定币对手腿 = 买/卖；两个代币一进一出 = token-token 互换；
+/// 其余视为转账。
+pub fn parse_wallet_events(tx: &Value, owner: &str) -> Vec<crate::types::WatchEvent> {
+    let Some(meta) = tx.get("meta") else {
+        return vec![];
+    };
+    if !meta["err"].is_null() {
+        return vec![];
+    }
+    // 钱包涉及的所有非 wSOL/稳定币 mint
+    let mut mints: Vec<String> = Vec::new();
+    for key in ["preTokenBalances", "postTokenBalances"] {
+        for b in meta[key].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+            if b["owner"].as_str() != Some(owner) {
+                continue;
+            }
+            let Some(m) = b["mint"].as_str() else { continue };
+            if m == WSOL || m == USDC || m == USDT {
+                continue;
+            }
+            if !mints.iter().any(|x| x == m) {
+                mints.push(m.to_string());
+            }
+        }
+    }
+
+    let mut events = Vec::new();
+    for mint in &mints {
+        if let Some(e) = parse_event(tx, owner, mint) {
+            let pre = sum_balance(meta, "preTokenBalances", owner, mint);
+            let post = sum_balance(meta, "postTokenBalances", owner, mint);
+            events.push(crate::types::WatchEvent {
+                mint: mint.clone(),
+                event: e,
+                pre_balance: pre,
+                post_balance: post,
+            });
+        }
+    }
+    // token-token 互换：两个 mint 一进一出且都没有 SOL 对手腿 → 修正为买/卖标记
+    if events.len() == 2 && events.iter().all(|e| e.event.sol_amount == 0.0) {
+        let (a, b) = (events[0].event.side, events[1].event.side);
+        if a == Side::TransferIn && b == Side::TransferOut {
+            events[0].event.side = Side::Buy;
+            events[1].event.side = Side::Sell;
+        } else if a == Side::TransferOut && b == Side::TransferIn {
+            events[0].event.side = Side::Sell;
+            events[1].event.side = Side::Buy;
+        }
+    }
+    events
+}
+
+fn sum_balance(meta: &Value, key: &str, owner: &str, mint: &str) -> f64 {
+    meta[key]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|b| b["owner"].as_str() == Some(owner) && b["mint"].as_str() == Some(mint))
+                .map(|b| ui_amount(&b["uiTokenAmount"]))
+                .sum()
+        })
+        .unwrap_or(0.0)
+}
+
 /// 从 Raydium SOL/USDC 池推导 SOL/USD 汇率：
 /// 该池金库由 Raydium V4 权限账户持有，其 USDC 与 wSOL 的余额变化量之比
 /// 就是成交汇率（parse_event 以 USDC 为目标 mint 时 price_sol = SOL/USDC，取倒数）。

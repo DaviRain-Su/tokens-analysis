@@ -37,6 +37,10 @@ pub struct ExecConfig {
     pub positions_path: String,
     /// 买卖执行后推送通知
     pub notifier: Option<crate::notify::Notifier>,
+    /// TUI 仪表盘模式：不往 stdout 打印，动作进缓冲由仪表盘渲染
+    pub quiet: bool,
+    /// 即使没开止盈止损也巡检持仓现值（仪表盘需要）
+    pub value_positions: bool,
 }
 
 /// 本工具买入的单个仓位
@@ -46,6 +50,9 @@ pub struct Position {
     pub raw: u64,
     /// 累计 SOL 成本
     pub cost_sol: f64,
+    /// 最近一次巡检的可变现价值 (Jupiter 报价)
+    #[serde(skip)]
+    pub last_value_sol: Option<f64>,
 }
 
 pub struct Executor {
@@ -55,6 +62,8 @@ pub struct Executor {
     positions: HashMap<String, Position>,
     /// 安全检查结果缓存: mint → 是否通过
     safety_cache: HashMap<String, bool>,
+    /// 最近的跟单动作（仪表盘展示）
+    actions: std::collections::VecDeque<String>,
     spent_today: f64,
     day: String,
 }
@@ -79,7 +88,7 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(
             "MintA".to_string(),
-            Position { raw: 12345, cost_sol: 0.05 },
+            Position { raw: 12345, cost_sol: 0.05, last_value_sol: None },
         );
         std::fs::write(path, serde_json::to_string(&m).unwrap()).unwrap();
         let loaded = load_positions(path);
@@ -110,9 +119,46 @@ impl Executor {
                 .expect("http client"),
             wallet,
             safety_cache: HashMap::new(),
+            actions: Default::default(),
             spent_today: 0.0,
             day: String::new(),
         }
+    }
+
+    /// 输出一条动作信息：日志模式打到 stdout，仪表盘模式只进缓冲。
+    fn say(&mut self, line: String) {
+        if !self.cfg.quiet {
+            println!("{line}");
+        }
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        self.actions.push_back(format!("{ts} {line}"));
+        if self.actions.len() > 200 {
+            self.actions.pop_front();
+        }
+    }
+
+    pub fn recent_actions(&self) -> impl DoubleEndedIterator<Item = &String> {
+        self.actions.iter()
+    }
+
+    pub fn spent_today(&self) -> (f64, f64) {
+        (self.spent_today, self.cfg.max_daily_sol)
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.cfg.live
+    }
+
+    /// 仪表盘持仓视图: (mint, raw, 成本SOL, 现值SOL)
+    pub fn positions_view(&self) -> Vec<(String, u64, f64, Option<f64>)> {
+        let mut v: Vec<_> = self
+            .positions
+            .iter()
+            .filter(|(_, p)| p.raw > 0)
+            .map(|(m, p)| (m.clone(), p.raw, p.cost_sol, p.last_value_sol))
+            .collect();
+        v.sort_by(|a, b| b.2.total_cmp(&a.2));
+        v
     }
 
     fn save_positions(&self) {
@@ -126,7 +172,7 @@ impl Executor {
     /// 止盈/止损巡检：用 Jupiter 报价算每个持仓的可变现 SOL 价值，
     /// 与成本比较，触发则清仓。报价即真实可成交价，天然包含流动性深度。
     pub async fn check_positions(&mut self, rpc: &Rpc) {
-        if self.cfg.take_profit <= 0.0 && self.cfg.stop_loss <= 0.0 {
+        if self.cfg.take_profit <= 0.0 && self.cfg.stop_loss <= 0.0 && !self.cfg.value_positions {
             return;
         }
         let held: Vec<(String, Position)> = self
@@ -144,6 +190,9 @@ impl Executor {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0) as f64
                 / 1e9;
+            if let Some(p) = self.positions.get_mut(&mint) {
+                p.last_value_sol = Some(value_sol);
+            }
             let ratio = value_sol / pos.cost_sol;
             let reason = if self.cfg.take_profit > 0.0 && ratio >= self.cfg.take_profit {
                 "止盈"
@@ -152,15 +201,15 @@ impl Executor {
             } else {
                 continue;
             };
-            println!(
-                "  ⚡ {reason}触发 {}: 现值 {:.4} SOL / 成本 {:.4} SOL ({:.0}%)",
+            self.say(format!(
+                "⚡ {reason}触发 {}: 现值 {:.4} SOL / 成本 {:.4} SOL ({:.0}%)",
                 short(&mint),
                 value_sol,
                 pos.cost_sol,
                 ratio * 100.0
-            );
+            ));
             if let Err(e) = self.execute_sell(rpc, &mint, pos.raw, reason).await {
-                eprintln!("  ✗ {reason}卖出失败: {e}");
+                self.say(format!("✗ {reason}卖出失败: {e}"));
                 self.audit(json!({"action": "error", "mint": mint, "error": e.to_string()}));
             }
         }
@@ -174,7 +223,11 @@ impl Executor {
         let ok = match crate::safety::check_mint(rpc, mint).await {
             Ok(report) => {
                 if !report.is_safe() {
-                    println!("  ⚠ 安全检查不通过 {}: {}", short(mint), report.summary());
+                    self.say(format!(
+                        "⚠ 安全检查不通过 {}: {}",
+                        short(mint),
+                        report.summary()
+                    ));
                     self.audit(json!({
                         "action": "skip_buy", "mint": mint,
                         "reason": "safety", "risks": report.risks,
@@ -183,7 +236,7 @@ impl Executor {
                 report.is_safe()
             }
             Err(e) => {
-                eprintln!("  ⚠ 安全检查失败 {}: {e} (按不安全处理)", short(mint));
+                self.say(format!("⚠ 安全检查失败 {}: {e} (按不安全处理)", short(mint)));
                 false
             }
         };
@@ -202,7 +255,7 @@ impl Executor {
             _ => return,
         };
         if let Err(e) = res {
-            eprintln!("  ✗ 跟单失败: {e}");
+            self.say(format!("✗ 跟单失败: {e}"));
             self.audit(json!({"action": "error", "mint": ev.mint, "error": e.to_string()}));
         }
     }
@@ -223,12 +276,12 @@ impl Executor {
         }
         self.roll_day();
         if self.spent_today + self.cfg.buy_sol > self.cfg.max_daily_sol {
-            println!(
-                "  ⚠ 跳过跟买 {}: 今日已用 {:.3}/{:.3} SOL",
-                short(&ev.mint),
+            self.say(format!(
+                "⚠ 跳过跟买 {}: 今日已用 {:.3}/{:.3} SOL",
+                ev.token_disp(),
                 self.spent_today,
                 self.cfg.max_daily_sol
-            );
+            ));
             self.audit(json!({"action": "skip_buy", "mint": ev.mint, "reason": "daily_cap"}));
             return Ok(());
         }
@@ -244,11 +297,11 @@ impl Executor {
             .unwrap_or(0.0);
         let disp = ev.token_disp();
         let mode = if self.cfg.live { "[LIVE]" } else { "[paper]" };
-        println!(
-            "  → 跟买 {disp}: {:.4} SOL (冲击 {:.2}%) {mode}",
+        self.say(format!(
+            "→ 跟买 {disp}: {:.4} SOL (冲击 {:.2}%) {mode}",
             self.cfg.buy_sol,
             impact * 100.0,
-        );
+        ));
         if let Some(n) = &self.cfg.notifier {
             n.send(
                 &format!("跟买 {disp} {mode}"),
@@ -262,7 +315,7 @@ impl Executor {
         }));
         if self.cfg.live {
             let sig = self.swap_and_send(rpc, &quote).await?;
-            println!("  ✓ 买入已确认: {sig}");
+            self.say(format!("✓ 买入已确认: {sig}"));
             self.audit(json!({"action": "buy_confirmed", "mint": ev.mint, "sig": sig}));
         }
         self.spent_today += self.cfg.buy_sol;
@@ -308,12 +361,12 @@ impl Executor {
             / 1e9;
         let fraction = sell_raw as f64 / held as f64;
         let mode = if self.cfg.live { "[LIVE]" } else { "[paper]" };
-        println!(
-            "  → {reason} {}: {:.0}% 仓位 ≈ {:.4} SOL {mode}",
+        self.say(format!(
+            "→ {reason} {}: {:.0}% 仓位 ≈ {:.4} SOL {mode}",
             short(mint),
             fraction * 100.0,
             out_sol,
-        );
+        ));
         if let Some(n) = &self.cfg.notifier {
             n.send(
                 &format!("{reason} {} {mode}", short(mint)),
@@ -327,7 +380,7 @@ impl Executor {
         });
         if self.cfg.live {
             let sig = self.swap_and_send(rpc, &quote).await?;
-            println!("  ✓ 卖出已确认: {sig}");
+            self.say(format!("✓ 卖出已确认: {sig}"));
             entry["sig"] = json!(sig);
         }
         let pos = self.positions.get_mut(mint).unwrap();

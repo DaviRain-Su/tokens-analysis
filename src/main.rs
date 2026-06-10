@@ -1,5 +1,6 @@
 //! tokens-analysis: Solana SPL Token 筹码结构与资金流向分析工具。
 
+mod dash;
 mod flow;
 mod holders;
 mod labels;
@@ -94,6 +95,10 @@ struct WatchArgs {
     /// 买卖执行后推送通知: desktop (macOS) | telegram (env TELEGRAM_BOT_TOKEN/CHAT_ID)
     #[arg(long)]
     notify: Option<String>,
+
+    /// TUI 仪表盘模式（事件流 + 实时持仓盈亏 + 跟单动作）
+    #[arg(long)]
+    tui: bool,
 
     /// 开启跟单（默认 paper 模式，只记录不下单）
     #[arg(long)]
@@ -317,6 +322,11 @@ async fn cmd_watch(mut args: WatchArgs) -> Result<()> {
     eprintln!("RPC: {}", redact(&rpc_url));
     let rpc = Rpc::new(&rpc_url, args.concurrency);
 
+    let sol_usd = if args.copy || args.tui {
+        pnl::sol_usd_price(&rpc).await
+    } else {
+        None
+    };
     let mut executor = if args.copy {
         let keypair_path = args.keypair.clone().unwrap_or_else(|| {
             format!(
@@ -325,7 +335,6 @@ async fn cmd_watch(mut args: WatchArgs) -> Result<()> {
             )
         });
         let w = wallet::Wallet::load(&keypair_path)?;
-        let sol_usd = pnl::sol_usd_price(&rpc).await;
         if let Some(r) = sol_usd {
             println!("SOL/USD: ${r:.2} (稳定币买入信号按此折算触发阈值)");
         }
@@ -350,6 +359,8 @@ async fn cmd_watch(mut args: WatchArgs) -> Result<()> {
                 .as_deref()
                 .map(notify::Notifier::from_kind)
                 .transpose()?,
+            quiet: args.tui,
+            value_positions: args.tui,
         };
         let exec = trade::Executor::new(cfg, w);
         println!(
@@ -391,6 +402,9 @@ async fn cmd_watch(mut args: WatchArgs) -> Result<()> {
 
     let mut watcher = watch::Watcher::new(&rpc, &args.wallets).await?;
     if args.no_ws {
+        if args.tui {
+            anyhow::bail!("--tui 需要 WebSocket 模式，与 --no-ws 不兼容");
+        }
         return watcher
             .run_polling(&rpc, args.interval, executor.as_mut())
             .await;
@@ -400,7 +414,14 @@ async fn cmd_watch(mut args: WatchArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| ws::derive_ws_url(&rpc_url));
     watcher
-        .run_ws(&rpc, ws_url, args.price_check_interval, executor.as_mut())
+        .run_ws(
+            &rpc,
+            ws_url,
+            args.price_check_interval,
+            executor.as_mut(),
+            args.tui,
+            sol_usd,
+        )
         .await
 }
 

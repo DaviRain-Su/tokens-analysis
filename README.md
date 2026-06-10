@@ -87,6 +87,15 @@ tokens-analysis analyze <MINT> --diff              # 对比最近一次快照
 监控默认走 **WebSocket 实时推送**（logsSubscribe，亚秒级延迟，断线自动重连），
 WS 端点由 RPC URL 自动推导；`--no-ws` 可强制回退轮询模式。
 
+`--tui` 进入**实时仪表盘**：左侧滚动事件流，右上持仓面板（实时现值/浮动盈亏，
+Jupiter 报价估值），右下跟单动作记录；顶部状态栏显示今日额度、SOL 价格、连接状态。
+`↑↓` 回看历史事件，`q` 退出。
+
+```bash
+tokens-analysis watch --wallets-file smart.jsonl --copy --tui \
+  --take-profit 2 --stop-loss 0.5
+```
+
 仓位持久化在 `positions-paper.json`（live 模式 `positions.json`），重启自动恢复。
 止盈止损用 Jupiter 报价计算持仓的**真实可变现价值**（天然包含流动性深度与价格冲击），
 每 `--price-check-interval` 秒巡检一次。

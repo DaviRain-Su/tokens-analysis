@@ -81,38 +81,88 @@ impl Watcher {
     }
 
     /// WebSocket 实时模式：logsSubscribe 推送签名，亚秒级延迟。
+    /// `tui` 开启时渲染仪表盘（事件流 + 持仓 + 跟单动作）。
     pub async fn run_ws(
         &mut self,
         rpc: &Rpc,
         ws_url: String,
         price_check_interval: u64,
         mut executor: Option<&mut Executor>,
+        tui: bool,
+        sol_usd: Option<f64>,
     ) -> Result<()> {
         let wallets: Vec<String> = self.cursor.keys().cloned().collect();
-        println!(
-            "开始监控 {} 个钱包 (WebSocket 实时推送, Ctrl-C 退出)...",
-            wallets.len()
-        );
+        let wallet_count = wallets.len();
+        if !tui {
+            println!("开始监控 {wallet_count} 个钱包 (WebSocket 实时推送, Ctrl-C 退出)...");
+        }
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, String)>(256);
         tokio::spawn(crate::ws::subscribe_task(ws_url, wallets, tx));
+
+        let mut terminal = tui.then(ratatui::init);
+        let mut feed: std::collections::VecDeque<crate::dash::FeedItem> = Default::default();
+        let mut scroll = 0usize;
+        let mut ws_connected = false;
 
         // 同一笔交易可能涉及多个监控钱包，按签名去重（保留最近 512 个）
         let mut seen: std::collections::VecDeque<String> = Default::default();
         let mut tick =
             tokio::time::interval(Duration::from_secs(price_check_interval.max(5)));
         tick.tick().await;
+        let mut frame = tokio::time::interval(Duration::from_millis(200));
 
-        loop {
+        let result = loop {
             tokio::select! {
                 _ = tick.tick() => {
                     if let Some(exec) = executor.as_deref_mut() {
                         exec.check_positions(rpc).await;
                     }
                 }
+                _ = frame.tick(), if tui => {
+                    // 非阻塞处理按键
+                    while ratatui::crossterm::event::poll(Duration::ZERO)? {
+                        if let ratatui::crossterm::event::Event::Key(key) =
+                            ratatui::crossterm::event::read()?
+                        {
+                            use ratatui::crossterm::event::{KeyCode, KeyEventKind};
+                            if key.kind != KeyEventKind::Press {
+                                continue;
+                            }
+                            match key.code {
+                                KeyCode::Char('q') | KeyCode::Esc => {
+                                    ratatui::restore();
+                                    return Ok(());
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    scroll = (scroll + 1).min(feed.len());
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    scroll = scroll.saturating_sub(1);
+                                }
+                                KeyCode::PageUp => scroll = (scroll + 15).min(feed.len()),
+                                KeyCode::PageDown => scroll = scroll.saturating_sub(15),
+                                KeyCode::End => scroll = 0,
+                                _ => {}
+                            }
+                        }
+                    }
+                    if let Some(t) = terminal.as_mut() {
+                        let view = crate::dash::DashView {
+                            feed: &feed,
+                            executor: executor.as_deref(),
+                            wallet_count,
+                            sol_usd,
+                            scroll,
+                            ws_connected,
+                        };
+                        t.draw(|f| crate::dash::draw(f, &view))?;
+                    }
+                }
                 msg = rx.recv() => {
                     let Some((wallet, sig)) = msg else {
-                        anyhow::bail!("WebSocket 任务退出");
+                        break Err(anyhow::anyhow!("WebSocket 任务退出"));
                     };
+                    ws_connected = true;
                     if seen.contains(&sig) {
                         continue;
                     }
@@ -125,17 +175,36 @@ impl Watcher {
                             let mut events = parse_wallet_events(&tx_data, &wallet);
                             self.fill_symbols(rpc, &mut events).await;
                             for ev in &events {
-                                print_event(&wallet, ev);
+                                if !tui {
+                                    print_event(&wallet, ev);
+                                }
                                 if let Some(exec) = executor.as_deref_mut() {
                                     exec.on_event(rpc, &wallet, ev).await;
                                 }
                             }
+                            for ev in events {
+                                feed.push_back(crate::dash::FeedItem {
+                                    wallet: wallet.clone(),
+                                    ev,
+                                });
+                                if feed.len() > 1000 {
+                                    feed.pop_front();
+                                }
+                            }
                         }
-                        Err(e) => eprintln!("⚠ 获取交易 {} 失败: {e}", short(&sig)),
+                        Err(e) => {
+                            if !tui {
+                                eprintln!("⚠ 获取交易 {} 失败: {e}", short(&sig));
+                            }
+                        }
                     }
                 }
             }
+        };
+        if tui {
+            ratatui::restore();
         }
+        result
     }
 
     /// 拉取一个钱包自上次以来的新交易，按时间顺序返回事件。

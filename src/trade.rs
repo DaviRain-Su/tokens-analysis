@@ -11,6 +11,7 @@ use crate::rpc::Rpc;
 use crate::types::{Side, WatchEvent, short};
 use crate::wallet::Wallet;
 use anyhow::{Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Write;
@@ -28,14 +29,28 @@ pub struct ExecConfig {
     pub sol_usd: Option<f64>,
     /// 跳过安全检查照常跟买（不建议）
     pub allow_risky: bool,
+    /// 止盈倍数 (如 2.0 = 现值达到成本 2 倍时清仓)，0 = 关闭
+    pub take_profit: f64,
+    /// 止损倍数 (如 0.5 = 现值跌到成本一半时清仓)，0 = 关闭
+    pub stop_loss: f64,
+    /// 仓位持久化文件
+    pub positions_path: String,
+}
+
+/// 本工具买入的单个仓位
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Position {
+    /// 原始单位数量 (raw amount)
+    pub raw: u64,
+    /// 累计 SOL 成本
+    pub cost_sol: f64,
 }
 
 pub struct Executor {
     cfg: ExecConfig,
     http: reqwest::Client,
     wallet: Wallet,
-    /// 本工具买入的仓位: mint → 原始单位数量 (raw amount)
-    positions: HashMap<String, u64>,
+    positions: HashMap<String, Position>,
     /// 安全检查结果缓存: mint → 是否通过
     safety_cache: HashMap<String, bool>,
     spent_today: f64,
@@ -44,19 +59,108 @@ pub struct Executor {
 
 const WSOL: &str = "So11111111111111111111111111111111111111112";
 
+fn load_positions(path: &str) -> HashMap<String, Position> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn positions_roundtrip() {
+        let path = std::env::temp_dir().join("ta-positions-test.json");
+        let path = path.to_str().unwrap();
+        let mut m = HashMap::new();
+        m.insert(
+            "MintA".to_string(),
+            Position { raw: 12345, cost_sol: 0.05 },
+        );
+        std::fs::write(path, serde_json::to_string(&m).unwrap()).unwrap();
+        let loaded = load_positions(path);
+        assert_eq!(loaded["MintA"].raw, 12345);
+        assert!((loaded["MintA"].cost_sol - 0.05).abs() < 1e-12);
+        let _ = std::fs::remove_file(path);
+        // 文件不存在 → 空仓位
+        assert!(load_positions("/nonexistent/positions.json").is_empty());
+    }
+}
+
 impl Executor {
     pub fn new(cfg: ExecConfig, wallet: Wallet) -> Self {
+        let positions = load_positions(&cfg.positions_path);
+        if !positions.is_empty() {
+            println!(
+                "已从 {} 恢复 {} 个仓位",
+                cfg.positions_path,
+                positions.len()
+            );
+        }
         Self {
+            positions,
             cfg,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("http client"),
             wallet,
-            positions: HashMap::new(),
             safety_cache: HashMap::new(),
             spent_today: 0.0,
             day: String::new(),
+        }
+    }
+
+    fn save_positions(&self) {
+        let live: HashMap<&String, &Position> =
+            self.positions.iter().filter(|(_, p)| p.raw > 0).collect();
+        if let Ok(s) = serde_json::to_string_pretty(&live) {
+            let _ = std::fs::write(&self.cfg.positions_path, s);
+        }
+    }
+
+    /// 止盈/止损巡检：用 Jupiter 报价算每个持仓的可变现 SOL 价值，
+    /// 与成本比较，触发则清仓。报价即真实可成交价，天然包含流动性深度。
+    pub async fn check_positions(&mut self, rpc: &Rpc) {
+        if self.cfg.take_profit <= 0.0 && self.cfg.stop_loss <= 0.0 {
+            return;
+        }
+        let held: Vec<(String, Position)> = self
+            .positions
+            .iter()
+            .filter(|(_, p)| p.raw > 0 && p.cost_sol > 0.0)
+            .map(|(m, p)| (m.clone(), p.clone()))
+            .collect();
+        for (mint, pos) in held {
+            let Ok(quote) = self.quote(&mint, WSOL, pos.raw).await else {
+                continue;
+            };
+            let value_sol = quote["outAmount"]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0) as f64
+                / 1e9;
+            let ratio = value_sol / pos.cost_sol;
+            let reason = if self.cfg.take_profit > 0.0 && ratio >= self.cfg.take_profit {
+                "止盈"
+            } else if self.cfg.stop_loss > 0.0 && ratio <= self.cfg.stop_loss {
+                "止损"
+            } else {
+                continue;
+            };
+            println!(
+                "  ⚡ {reason}触发 {}: 现值 {:.4} SOL / 成本 {:.4} SOL ({:.0}%)",
+                short(&mint),
+                value_sol,
+                pos.cost_sol,
+                ratio * 100.0
+            );
+            if let Err(e) = self.execute_sell(rpc, &mint, pos.raw, reason).await {
+                eprintln!("  ✗ {reason}卖出失败: {e}");
+                self.audit(json!({"action": "error", "mint": mint, "error": e.to_string()}));
+            }
         }
     }
 
@@ -148,21 +252,21 @@ impl Executor {
             "sol": self.cfg.buy_sol, "quote_out": out_amount,
             "mode": if self.cfg.live { "live" } else { "paper" },
         }));
-        if !self.cfg.live {
-            self.spent_today += self.cfg.buy_sol;
-            *self.positions.entry(ev.mint.clone()).or_default() += out_amount;
-            return Ok(());
+        if self.cfg.live {
+            let sig = self.swap_and_send(rpc, &quote).await?;
+            println!("  ✓ 买入已确认: {sig}");
+            self.audit(json!({"action": "buy_confirmed", "mint": ev.mint, "sig": sig}));
         }
-        let sig = self.swap_and_send(rpc, &quote).await?;
         self.spent_today += self.cfg.buy_sol;
-        *self.positions.entry(ev.mint.clone()).or_default() += out_amount;
-        println!("  ✓ 买入已确认: {sig}");
-        self.audit(json!({"action": "buy_confirmed", "mint": ev.mint, "sig": sig}));
+        let pos = self.positions.entry(ev.mint.clone()).or_default();
+        pos.raw += out_amount;
+        pos.cost_sol += self.cfg.buy_sol;
+        self.save_positions();
         Ok(())
     }
 
     async fn maybe_copy_sell(&mut self, rpc: &Rpc, src: &str, ev: &WatchEvent) -> Result<()> {
-        let held = *self.positions.get(&ev.mint).unwrap_or(&0);
+        let held = self.positions.get(&ev.mint).map(|p| p.raw).unwrap_or(0);
         if held == 0 {
             return Ok(()); // 不持有此代币（只卖本工具买入的仓位）
         }
@@ -177,32 +281,48 @@ impl Executor {
         if sell_raw == 0 {
             return Ok(());
         }
-        let quote = self.quote(&ev.mint, WSOL, sell_raw).await?;
+        self.audit(json!({"action": "copy_sell_signal", "src": src, "mint": ev.mint, "fraction": fraction}));
+        self.execute_sell(rpc, &ev.mint, sell_raw, "跟卖").await
+    }
+
+    /// 卖出仓位（跟卖/止盈/止损共用）。paper 模式只做账。
+    async fn execute_sell(&mut self, rpc: &Rpc, mint: &str, sell_raw: u64, reason: &str) -> Result<()> {
+        let held = self.positions.get(mint).map(|p| p.raw).unwrap_or(0);
+        let sell_raw = sell_raw.min(held);
+        if sell_raw == 0 {
+            return Ok(());
+        }
+        let quote = self.quote(mint, WSOL, sell_raw).await?;
         let out_sol = quote["outAmount"]
             .as_str()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0) as f64
             / 1e9;
+        let fraction = sell_raw as f64 / held as f64;
         println!(
-            "  → 跟卖 {}: {:.0}% 仓位 ≈ {:.4} SOL {}",
-            short(&ev.mint),
+            "  → {reason} {}: {:.0}% 仓位 ≈ {:.4} SOL {}",
+            short(mint),
             fraction * 100.0,
             out_sol,
             if self.cfg.live { "[LIVE]" } else { "[paper]" }
         );
-        self.audit(json!({
-            "action": "copy_sell", "src": src, "mint": ev.mint,
-            "fraction": fraction, "sell_raw": sell_raw, "est_sol": out_sol,
+        let mut entry = json!({
+            "action": "sell", "reason": reason, "mint": mint,
+            "sell_raw": sell_raw, "est_sol": out_sol,
             "mode": if self.cfg.live { "live" } else { "paper" },
-        }));
-        if !self.cfg.live {
-            *self.positions.get_mut(&ev.mint).unwrap() = held - sell_raw;
-            return Ok(());
+        });
+        if self.cfg.live {
+            let sig = self.swap_and_send(rpc, &quote).await?;
+            println!("  ✓ 卖出已确认: {sig}");
+            entry["sig"] = json!(sig);
         }
-        let sig = self.swap_and_send(rpc, &quote).await?;
-        *self.positions.get_mut(&ev.mint).unwrap() = held - sell_raw;
-        println!("  ✓ 卖出已确认: {sig}");
-        self.audit(json!({"action": "sell_confirmed", "mint": ev.mint, "sig": sig}));
+        let pos = self.positions.get_mut(mint).unwrap();
+        let cost_removed = pos.cost_sol * fraction;
+        pos.raw -= sell_raw;
+        pos.cost_sol -= cost_removed;
+        entry["realized_sol"] = json!(out_sol - cost_removed);
+        self.audit(entry);
+        self.save_positions();
         Ok(())
     }
 
@@ -272,6 +392,14 @@ impl Executor {
             self.day = today;
             self.spent_today = 0.0;
         }
+    }
+
+    pub fn positions_summary(&self) -> Vec<(String, u64, f64)> {
+        self.positions
+            .iter()
+            .filter(|(_, p)| p.raw > 0)
+            .map(|(m, p)| (m.clone(), p.raw, p.cost_sol))
+            .collect()
     }
 
     fn audit(&self, mut entry: Value) {

@@ -66,7 +66,17 @@ tokens-analysis watch --wallets <W1> --copy
 # 真实下单（启动时需确认；务必先跑 paper 验证）
 tokens-analysis watch --wallets <W1> --copy --live \
   --buy-sol 0.05 --max-daily-sol 0.5 --slippage-bps 300 --min-trigger-sol 0.5
+
+# 止盈止损：现值达成本 2 倍清仓 / 跌到一半清仓（paper 模式也生效）
+tokens-analysis watch --wallets <W1> --copy --take-profit 2.0 --stop-loss 0.5
 ```
+
+监控默认走 **WebSocket 实时推送**（logsSubscribe，亚秒级延迟，断线自动重连），
+WS 端点由 RPC URL 自动推导；`--no-ws` 可强制回退轮询模式。
+
+仓位持久化在 `positions-paper.json`（live 模式 `positions.json`），重启自动恢复。
+止盈止损用 Jupiter 报价计算持仓的**真实可变现价值**（天然包含流动性深度与价格冲击），
+每 `--price-check-interval` 秒巡检一次。
 
 执行路径：Jupiter Swap API 报价/组交易 → 本地 ed25519 签名（签名前校验
 fee payer 是本钱包）→ `sendTransaction`（含 preflight 模拟）→ 轮询确认。

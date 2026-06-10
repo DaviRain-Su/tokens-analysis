@@ -27,7 +27,8 @@ impl Watcher {
         Ok(Self { cursor })
     }
 
-    pub async fn run(
+    /// 轮询模式（WebSocket 不可用时的回退路径）
+    pub async fn run_polling(
         &mut self,
         rpc: &Rpc,
         interval: u64,
@@ -52,7 +53,66 @@ impl Watcher {
                     Err(e) => eprintln!("⚠ 轮询 {} 失败: {e}", short(&w)),
                 }
             }
+            if let Some(exec) = executor.as_deref_mut() {
+                exec.check_positions(rpc).await;
+            }
             tokio::time::sleep(Duration::from_secs(interval)).await;
+        }
+    }
+
+    /// WebSocket 实时模式：logsSubscribe 推送签名，亚秒级延迟。
+    pub async fn run_ws(
+        &mut self,
+        rpc: &Rpc,
+        ws_url: String,
+        price_check_interval: u64,
+        mut executor: Option<&mut Executor>,
+    ) -> Result<()> {
+        let wallets: Vec<String> = self.cursor.keys().cloned().collect();
+        println!(
+            "开始监控 {} 个钱包 (WebSocket 实时推送, Ctrl-C 退出)...",
+            wallets.len()
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, String)>(256);
+        tokio::spawn(crate::ws::subscribe_task(ws_url, wallets, tx));
+
+        // 同一笔交易可能涉及多个监控钱包，按签名去重（保留最近 512 个）
+        let mut seen: std::collections::VecDeque<String> = Default::default();
+        let mut tick =
+            tokio::time::interval(Duration::from_secs(price_check_interval.max(5)));
+        tick.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    if let Some(exec) = executor.as_deref_mut() {
+                        exec.check_positions(rpc).await;
+                    }
+                }
+                msg = rx.recv() => {
+                    let Some((wallet, sig)) = msg else {
+                        anyhow::bail!("WebSocket 任务退出");
+                    };
+                    if seen.contains(&sig) {
+                        continue;
+                    }
+                    seen.push_back(sig.clone());
+                    if seen.len() > 512 {
+                        seen.pop_front();
+                    }
+                    match fetch_tx_with_retry(rpc, &sig).await {
+                        Ok(tx_data) => {
+                            for ev in parse_wallet_events(&tx_data, &wallet) {
+                                print_event(&wallet, &ev);
+                                if let Some(exec) = executor.as_deref_mut() {
+                                    exec.on_event(rpc, &wallet, &ev).await;
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("⚠ 获取交易 {} 失败: {e}", short(&sig)),
+                    }
+                }
+            }
         }
     }
 
@@ -86,6 +146,20 @@ impl Watcher {
         }
         Ok(events)
     }
+}
+
+/// 通知推送先于交易可查（索引滞后），带退避重试。
+async fn fetch_tx_with_retry(rpc: &Rpc, sig: &str) -> Result<serde_json::Value> {
+    let mut delay = Duration::from_millis(300);
+    for _ in 0..5 {
+        let tx = rpc.transaction(sig).await?;
+        if !tx.is_null() {
+            return Ok(tx);
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(3));
+    }
+    anyhow::bail!("交易在重试后仍不可查")
 }
 
 fn print_event(wallet: &str, ev: &WatchEvent) {

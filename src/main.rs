@@ -12,6 +12,7 @@ mod tui;
 mod types;
 mod wallet;
 mod watch;
+mod ws;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -59,9 +60,33 @@ struct WatchArgs {
     #[arg(long, env = "SOLANA_RPC_URL")]
     rpc: Option<String>,
 
-    /// 轮询间隔（秒）
+    /// 轮询间隔（秒，仅轮询模式）
     #[arg(long, default_value_t = 5)]
     interval: u64,
+
+    /// 禁用 WebSocket 实时推送，强制轮询
+    #[arg(long)]
+    no_ws: bool,
+
+    /// WebSocket 端点（默认由 RPC URL 推导: https→wss）
+    #[arg(long)]
+    ws_url: Option<String>,
+
+    /// 止盈倍数（如 2.0 = 现值达成本 2 倍清仓），0 = 关闭
+    #[arg(long, default_value_t = 0.0)]
+    take_profit: f64,
+
+    /// 止损倍数（如 0.5 = 现值跌到成本一半清仓），0 = 关闭
+    #[arg(long, default_value_t = 0.0)]
+    stop_loss: f64,
+
+    /// 止盈止损巡检间隔（秒）
+    #[arg(long, default_value_t = 20)]
+    price_check_interval: u64,
+
+    /// 仓位持久化文件（默认 paper 模式 positions-paper.json，live 模式 positions.json）
+    #[arg(long)]
+    positions_file: Option<String>,
 
     /// 开启跟单（默认 paper 模式，只记录不下单）
     #[arg(long)]
@@ -300,6 +325,11 @@ async fn cmd_watch(mut args: WatchArgs) -> Result<()> {
             log_path: args.log.clone(),
             sol_usd,
             allow_risky: args.allow_risky,
+            take_profit: args.take_profit,
+            stop_loss: args.stop_loss,
+            positions_path: args.positions_file.clone().unwrap_or_else(|| {
+                if args.live { "positions.json" } else { "positions-paper.json" }.into()
+            }),
         };
         let exec = trade::Executor::new(cfg, w);
         println!(
@@ -327,8 +357,31 @@ async fn cmd_watch(mut args: WatchArgs) -> Result<()> {
         None
     };
 
+    if args.take_profit > 0.0 || args.stop_loss > 0.0 {
+        println!(
+            "止盈止损: TP={}x SL={}x (每 {}s 巡检)",
+            args.take_profit, args.stop_loss, args.price_check_interval
+        );
+    }
+    if let Some(exec) = &executor {
+        for (mint, raw, cost) in exec.positions_summary() {
+            println!("  持仓: {} raw={raw} 成本={cost:.4} SOL", types::short(&mint));
+        }
+    }
+
     let mut watcher = watch::Watcher::new(&rpc, &args.wallets).await?;
-    watcher.run(&rpc, args.interval, executor.as_mut()).await
+    if args.no_ws {
+        return watcher
+            .run_polling(&rpc, args.interval, executor.as_mut())
+            .await;
+    }
+    let ws_url = args
+        .ws_url
+        .clone()
+        .unwrap_or_else(|| ws::derive_ws_url(&rpc_url));
+    watcher
+        .run_ws(&rpc, ws_url, args.price_check_interval, executor.as_mut())
+        .await
 }
 
 /// RPC 解析顺序: --rpc / SOLANA_RPC_URL → Solana CLI 配置文件 → 公共节点

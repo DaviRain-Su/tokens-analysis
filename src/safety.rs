@@ -3,9 +3,10 @@
 
 use crate::rpc::Rpc;
 use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SafetyReport {
     pub mint_authority: Option<String>,
     pub freeze_authority: Option<String>,

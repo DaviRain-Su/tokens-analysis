@@ -1,5 +1,6 @@
 //! tokens-analysis: Solana SPL Token 筹码结构与资金流向分析工具。
 
+mod cache;
 mod chart;
 mod dash;
 mod flow;
@@ -206,6 +207,10 @@ struct Args {
     /// 与历史快照对比筹码迁移（不带值 = 最近一次快照，或指定文件路径）
     #[arg(long, num_args = 0..=1, default_missing_value = "latest")]
     diff: Option<String>,
+
+    /// 忽略缓存，强制重新从 RPC 拉取并分析
+    #[arg(long)]
+    refresh: bool,
 }
 
 #[tokio::main]
@@ -226,27 +231,69 @@ async fn main() -> Result<()> {
     }
 }
 
+fn cache_params_from(args: &Args) -> cache::CacheParams {
+    let mut owners = args.owners.clone();
+    owners.sort();
+    cache::CacheParams {
+        top: args.top,
+        tx_limit: args.tx_limit,
+        funding_scan: args.funding_scan,
+        hops: args.hops,
+        holders_mode: args.holders_mode.clone(),
+        owners,
+    }
+}
+
+fn needs_live_fetch(args: &Args) -> bool {
+    args.refresh || args.diff.is_some() || args.snapshot
+}
+
 async fn cmd_analyze(args: Args) -> Result<()> {
-    let rpc_url = resolve_rpc(args.rpc.as_deref());
-    // 公共节点限流很紧，自动降低并发
-    let concurrency = if rpc_url.contains("api.mainnet-beta.solana.com") {
-        args.concurrency.min(2)
+    let cache_params = cache_params_from(&args);
+
+    let analysis = if needs_live_fetch(&args) {
+        if args.refresh {
+            eprintln!("ℹ --refresh：强制重新分析");
+        }
+        let rpc_url = resolve_rpc(args.rpc.as_deref());
+        let concurrency = if rpc_url.contains("api.mainnet-beta.solana.com") {
+            args.concurrency.min(2)
+        } else {
+            args.concurrency
+        };
+        eprintln!("RPC: {}", redact(&rpc_url));
+        let rpc = Rpc::new(&rpc_url, concurrency);
+        let analysis = run_analysis(&rpc, &args).await?;
+        cache::save(&args.mint, &cache_params, &analysis)?;
+        analysis
+    } else if let Some(cached) = cache::load(&args.mint, &cache_params)? {
+        cached
     } else {
-        args.concurrency
+        let rpc_url = resolve_rpc(args.rpc.as_deref());
+        let concurrency = if rpc_url.contains("api.mainnet-beta.solana.com") {
+            args.concurrency.min(2)
+        } else {
+            args.concurrency
+        };
+        eprintln!("RPC: {}", redact(&rpc_url));
+        let rpc = Rpc::new(&rpc_url, concurrency);
+        let analysis = run_analysis(&rpc, &args).await?;
+        cache::save(&args.mint, &cache_params, &analysis)?;
+        analysis
     };
-    eprintln!("RPC: {}", redact(&rpc_url));
-    let rpc = Rpc::new(&rpc_url, concurrency);
 
-    let analysis = run_analysis(&rpc, &args).await?;
+    present_analysis(&analysis, &args)
+}
 
+fn present_analysis(analysis: &Analysis, args: &Args) -> Result<()> {
     if let Some(path) = &args.export_smart_money {
-        export_smart_money(&analysis, path, args.smart_min_score)?;
+        export_smart_money(analysis, path, args.smart_min_score)?;
     }
 
     if args.no_tui || !std::io::stdout().is_terminal() {
-        report::print(&analysis);
+        report::print(analysis);
     } else {
-        tui::run(&analysis)?;
+        tui::run(analysis)?;
     }
     Ok(())
 }

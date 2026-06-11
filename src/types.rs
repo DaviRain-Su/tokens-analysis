@@ -1,6 +1,8 @@
 //! 共享数据模型。
 
-#[derive(Clone, Debug)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenInfo {
     pub mint: String,
     /// Metaplex / Token-2022 元数据里的 symbol
@@ -14,7 +16,7 @@ pub struct TokenInfo {
     pub holders_complete: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Holder {
     pub owner: String,
     pub token_accounts: Vec<String>,
@@ -25,7 +27,7 @@ pub struct Holder {
     pub label: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Side {
     Buy,
     Sell,
@@ -33,7 +35,7 @@ pub enum Side {
     TransferOut,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TradeEvent {
     /// 暂未在界面展示，保留用于后续交易明细视图
     #[allow(dead_code)]
@@ -52,7 +54,7 @@ pub struct TradeEvent {
     pub counterparty: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HolderPnl {
     pub owner: String,
     pub events: Vec<TradeEvent>,
@@ -104,7 +106,7 @@ impl WatchEvent {
 }
 
 /// Top 持有人之间的代币互转聚合边
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransferLink {
     pub from: String,
     pub to: String,
@@ -114,7 +116,7 @@ pub struct TransferLink {
 }
 
 /// 与历史快照的筹码对比
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotDiff {
     pub base_time: i64,
     /// (owner, 旧余额, 新余额)，按变化量绝对值降序
@@ -123,7 +125,7 @@ pub struct SnapshotDiff {
     pub exited_holders: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FundingSource {
     pub source: String,
     pub label: Option<String>,
@@ -132,7 +134,7 @@ pub struct FundingSource {
     pub first_time: Option<i64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HolderFlow {
     pub owner: String,
     pub sources: Vec<FundingSource>,
@@ -141,7 +143,7 @@ pub struct HolderFlow {
     pub reached_genesis: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Cluster {
     pub source: String,
     pub label: Option<String>,
@@ -151,7 +153,7 @@ pub struct Cluster {
     pub time_span_secs: Option<i64>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Distribution {
     pub top1_pct: f64,
     pub top10_pct: f64,
@@ -163,7 +165,7 @@ pub struct Distribution {
     pub buckets: Vec<(String, usize, f64)>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Analysis {
     pub token: TokenInfo,
     /// 按余额降序的全部持有人（或回退模式下的 Top20）
